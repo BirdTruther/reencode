@@ -11,7 +11,7 @@ Downscales your TV library to 720p HEVC using hardware encoding (VAAPI) to save 
 ## Quick start
 
 ```bash
-git clone <repo-url>
+git clone <https://github.com/BirdTruther/reencode>
 cd reencode
 ./encodetv
 ```
