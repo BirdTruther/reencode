@@ -1,0 +1,179 @@
+#!/bin/bash
+# TV Show Re-encoder Launcher
+# Auto-discovers shows in your library, caches the scan, and launches reencode.sh.
+
+# shellcheck source=common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+
+SCRIPT="${SCRIPT_DIR}/reencode.sh"
+
+mkdir -p "$LOG_DIR"
+
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════════${NC}"
+echo -e "${CYAN}          TV Show Re-encoder               ${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════${NC}"
+echo ""
+
+load_config
+
+if [[ -z "$TV_DIR" ]]; then
+    echo -e "  ${RED}No TV library found.${NC}"
+    echo "  Run: ${SCRIPT_DIR}/reencode.sh --setup"
+    exit 1
+fi
+if [[ ! -d "$TV_DIR" ]]; then
+    echo -e "  ${RED}TV dir not found: $TV_DIR${NC}"
+    echo "  Run: ${SCRIPT_DIR}/reencode.sh --setup"
+    exit 1
+fi
+
+# Load cache: name<TAB>size<TAB>total<TAB>1080<TAB>720<TAB>scanned_epoch
+declare -A CACHE_SIZE CACHE_TOTAL CACHE_1080 CACHE_720 CACHE_TIME
+if [[ -f "$CACHE_FILE" ]]; then
+    while IFS=$'\t' read -r name size total c1080 c720 ctime; do
+        [[ -n "$name" ]] || continue
+        CACHE_SIZE[$name]="$size"
+        CACHE_TOTAL[$name]="$total"
+        CACHE_1080[$name]="$c1080"
+        CACHE_720[$name]="$c720"
+        CACHE_TIME[$name]="$ctime"
+    done < "$CACHE_FILE"
+fi
+
+needs_rescan() {
+    local dir="$1" name="$2" newest
+    [[ -z "${CACHE_TIME[$name]:-}" ]] && return 0
+    newest=$(find "$dir" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.m4v" -o -iname "*.ts" \) -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+    [[ -z "$newest" ]] && return 0
+    awk "BEGIN { exit !($newest > ${CACHE_TIME[$name]}) }"
+}
+
+scan_show() {
+    local dir="$1" name="$2"
+    local c1080=0 c720=0 cother=0 total=0 h
+    while IFS= read -r -d '' f; do
+        total=$((total + 1))
+        h=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null | head -1)
+        if [[ -n "$h" ]]; then
+            if [[ "$h" -gt 720 ]]; then
+                c1080=$((c1080 + 1))
+            elif [[ "$h" -eq 720 ]]; then
+                c720=$((c720 + 1))
+            else
+                cother=$((cother + 1))
+            fi
+        else
+            cother=$((cother + 1))
+        fi
+    done < <(find "$dir" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.m4v" -o -iname "*.ts" \) -print0 2>/dev/null)
+    [[ "$total" -eq 0 ]] && return 1
+
+    local size now
+    size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+    now=$(date +%s)
+
+    CACHE_SIZE[$name]="$size"
+    CACHE_TOTAL[$name]="$total"
+    CACHE_1080[$name]="$c1080"
+    CACHE_720[$name]="$c720"
+    CACHE_TIME[$name]="$now"
+    return 0
+}
+
+declare -a show_names=() show_sizes=() show_status=() show_total_files=() show_1080_files=() show_720_files=()
+
+for dir in "$TV_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    show_name=$(basename "$dir")
+
+    if [[ -n "${CACHE_TOTAL[$show_name]:-}" ]] && ! needs_rescan "$dir" "$show_name"; then
+        total="${CACHE_TOTAL[$show_name]}"
+        size="${CACHE_SIZE[$show_name]}"
+        count_1080="${CACHE_1080[$show_name]}"
+        count_720="${CACHE_720[$show_name]}"
+    else
+        scan_show "$dir" "$show_name" || continue
+        total="${CACHE_TOTAL[$show_name]}"
+        size="${CACHE_SIZE[$show_name]}"
+        count_1080="${CACHE_1080[$show_name]}"
+        count_720="${CACHE_720[$show_name]}"
+    fi
+
+    if [[ "$count_1080" -eq 0 && "$count_720" -gt 0 ]]; then
+        status="${GREEN}DONE${NC}"
+    elif [[ "$count_1080" -gt 0 && "$count_720" -gt 0 ]]; then
+        status="${YELLOW}PARTIAL${NC}"
+    elif [[ "$count_1080" -gt 0 ]]; then
+        status="READY"
+    else
+        status="UNKNOWN"
+    fi
+
+    show_names+=("$show_name")
+    show_sizes+=("$size")
+    show_status+=("$status")
+    show_total_files+=("$total")
+    show_1080_files+=("$count_1080")
+    show_720_files+=("$count_720")
+done
+
+# Save cache
+: > "$CACHE_FILE"
+for name in "${show_names[@]}"; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "${CACHE_SIZE[$name]}" "${CACHE_TOTAL[$name]}" \
+        "${CACHE_1080[$name]}" "${CACHE_720[$name]}" "${CACHE_TIME[$name]}" \
+        >> "$CACHE_FILE"
+done
+
+# Display menu
+printf "  %-4s %-35s %-8s %-10s %s\n" "#" "SHOW" "SIZE" "FILES" "STATUS"
+echo "  ──── ─────────────────────────────────── ──────── ────────── ────────"
+
+for i in "${!show_names[@]}"; do
+    num=$((i + 1))
+    printf "  %-4s %-35s %-8s " "$num" "${show_names[$i]}" "${show_sizes[$i]}"
+    printf "%s/%s    " "${show_720_files[$i]}" "${show_total_files[$i]}"
+    echo -e "${show_status[$i]}"
+done
+
+echo ""
+read -p "  Pick a show to encode (1-${#show_names[@]}): " choice
+
+if [[ -z "$choice" || "$choice" -lt 1 || "$choice" -gt "${#show_names[@]}" ]]; then
+    echo "Invalid choice."
+    exit 1
+fi
+
+picked=$((choice - 1))
+selected="${show_names[$picked]}"
+logfile="${LOG_DIR}/$(echo "$selected" | tr ' ' '_' | tr -d '!').log"
+
+# Already done?
+if [[ "${show_1080_files[$picked]}" -eq 0 && "${show_720_files[$picked]}" -gt 0 ]]; then
+    echo ""
+    echo -e "  ${GREEN}Already done!${NC} All ${show_total_files[$picked]} files are ${TARGET_HEIGHT}p."
+    read -p "  Re-encode anyway? (y/N): " redo
+    if [[ "$redo" != "y" && "$redo" != "Y" ]]; then
+        exit 0
+    fi
+fi
+
+# Already running?
+if pgrep -f "reencode\.sh.*${selected}" > /dev/null 2>&1; then
+    echo ""
+    echo -e "  ${YELLOW}Already running!${NC} Check: tail -f $logfile"
+    exit 0
+fi
+
+echo ""
+echo -e "  Launching encode for: ${CYAN}${selected}${NC}"
+echo -e "  ${show_total_files[$picked]} files, ~$((${show_total_files[$picked]} * 4 / 60)) hours estimated"
+echo -e "  Log: $logfile"
+echo -e "  Monitor: tail -f $logfile"
+echo ""
+
+setsid bash "$SCRIPT" --show "$selected" > "$logfile" 2>&1 &
+echo -e "  ${GREEN}Started!${NC} (PID: $!)"
+echo ""

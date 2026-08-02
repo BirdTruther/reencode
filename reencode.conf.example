@@ -1,0 +1,18 @@
+# reencode.conf - copy this to reencode.conf (or just run the script, it auto-generates one)
+# Path to your TV library (parent dir of your show folders)
+TV_DIR="/mnt/plex_media/TV"
+
+# Where per-episode logs go
+LOG_DIR="/home/you/reencode_logs"
+
+# Scratch space for encoded files (use an SSD if you have one)
+TEMP_DIR="/tmp/reencode"
+
+# Downscale target: only files taller than this get re-encoded
+TARGET_HEIGHT=720
+
+# VAAPI quality, lower = better (20 ~ near-lossless, 32 = good/small)
+QUALITY=32
+
+# Hardware encode device (auto-detected if left empty)
+VAAPI_DEVICE=""
