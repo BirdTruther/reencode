@@ -369,6 +369,7 @@ class Library:
         for t in titles:
             above = at = below = unknown = 0
             size = above_size = 0
+            above_secs = 0.0
             for f in t["files"]:
                 size += f["size"]
                 h = f["height"]
@@ -377,6 +378,7 @@ class Library:
                 elif h > target:
                     above += 1
                     above_size += f["size"]
+                    above_secs += f["duration"] or 0
                 elif h == target:
                     at += 1
                 else:
@@ -390,7 +392,8 @@ class Library:
             out.append({
                 "name": t["name"], "path": t["path"], "library": t["library"],
                 "files": len(t["files"]), "above": above, "at": at, "below": below,
-                "unknown": unknown, "size": size, "above_size": above_size, "status": status,
+                "unknown": unknown, "size": size, "above_size": above_size,
+                "above_secs": above_secs, "status": status,
             })
         return out
 
@@ -443,12 +446,17 @@ class Job:
         self.paused = False
         self.paused_by = None        # "user" or "schedule"
         self.schedule_override = False
+        # For whole-title ETA: seconds of video still to encode, by file name.
+        self.todo = {}
+        self.total_todo = 0.0
+        self.speed_avg = None        # smoothed encode speed (x realtime)
 
     def add_line(self, line):
         self.seq += 1
         self.log.append((self.seq, line))
         m = RE_EPISODE.search(line)
         if m:
+            self.todo.pop(self.file, None)  # previous file is finished (or skipped)
             self.episode, self.episodes, self.file = int(m[1]), int(m[2]), m[3]
             self.duration, self.out_time, self.fps, self.speed = None, 0.0, None, None
             self.file_started = now()
@@ -470,6 +478,19 @@ class Job:
         if m:
             self.failures.append(m[1])
 
+    def update_speed(self, sample):
+        """Smooth ffmpeg's speed; ignore the first seconds of a file, which are noisy."""
+        if not sample or sample <= 0 or self.paused or self.out_time < 5:
+            return
+        self.speed_avg = sample if self.speed_avg is None else 0.85 * self.speed_avg + 0.15 * sample
+
+    def remaining_secs(self):
+        """Seconds of video left to encode in this title."""
+        left = sum(self.todo.values())
+        if self.file in self.todo:
+            left -= min(self.out_time, self.todo[self.file])
+        return max(0.0, left)
+
     def public(self):
         pct = None
         if self.duration and self.status == "running":
@@ -477,6 +498,12 @@ class Job:
         eta = None
         if pct is not None and self.speed and self.duration:
             eta = max(0.0, self.duration - self.out_time) / self.speed
+        left = self.remaining_secs()
+        title_pct = title_eta = None
+        if self.status == "running" and not self.dry_run and self.total_todo:
+            title_pct = max(0.0, min(1.0, 1 - left / self.total_todo))
+            if self.speed_avg:
+                title_eta = left / self.speed_avg
         return {
             "id": self.id, "path": self.path, "name": self.name, "library": self.library,
             "dry_run": self.dry_run, "status": self.status, "created": self.created,
@@ -487,6 +514,8 @@ class Job:
             "new_mb": self.new_mb, "encoded": self.encoded, "failures": self.failures[-20:],
             "returncode": self.returncode, "log_seq": self.seq,
             "paused": self.paused, "paused_by": self.paused_by,
+            "title_pct": title_pct, "title_eta": title_eta, "remaining_secs": left,
+            "speed_avg": self.speed_avg,
         }
 
     def history_record(self):
@@ -667,6 +696,13 @@ class JobRunner:
         env = dict(os.environ, REENCODE_PROGRESS=progress)
         cmd = ["bash", str(SCRIPT), "--dir", job.path] + (["--dry-run"] if job.dry_run else [])
 
+        title = self.app.library.title(job.path)
+        if title:
+            target = cfg["target_height"]
+            job.todo = {os.path.basename(f["rel"]): f["duration"] or 0.0
+                        for f in title["files"] if f["height"] and f["height"] > target}
+            job.total_todo = sum(job.todo.values())
+
         job.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True, env=env,
@@ -716,6 +752,7 @@ class JobRunner:
                 job.fps = float(vals["fps"]) if vals.get("fps") else None
                 sp = vals.get("speed", "").rstrip("x")
                 job.speed = float(sp) if sp and sp != "N/A" else None
+                job.update_speed(job.speed)
             except ValueError:
                 pass
 
@@ -728,6 +765,14 @@ class JobRunner:
                 "waiting_external": self.waiting_external,
                 "waiting_schedule": self.waiting_schedule and bool(self.queue),
             }
+
+    def last_speed(self):
+        """Most recent smoothed speed, for estimating before a job has warmed up."""
+        with self.lock:
+            for h in self.history:
+                if h.get("speed_avg") and not h.get("dry_run"):
+                    return h["speed_avg"]
+        return None
 
     def saved_total_mb(self):
         with self.lock:
@@ -795,10 +840,33 @@ class App:
     def reload_config(self):
         self.config = load_config()
 
+    def queue_eta(self, jobs, titles):
+        """Estimate encoding time for the running title plus everything queued."""
+        cur = jobs["current"]
+        speed = (cur and cur["speed_avg"]) or self.jobs.last_speed()
+        by_path = {t["path"]: t for t in titles}
+        per_job = {}
+        for j in jobs["queue"]:
+            t = by_path.get(j["path"])
+            secs = 0.0 if j["dry_run"] or not t else t["above_secs"]
+            per_job[j["id"]] = secs / speed if speed else None
+        cur_secs = cur["remaining_secs"] if cur and not cur["dry_run"] else 0.0
+        total_secs = cur_secs + sum((by_path.get(j["path"]) or {}).get("above_secs", 0)
+                                    for j in jobs["queue"] if not j["dry_run"])
+        return {
+            "speed": speed,
+            # Current title, using the last known speed while this one warms up.
+            "current_eta": cur_secs / speed if speed and cur and not cur["dry_run"] else None,
+            "per_job": per_job,
+            "queue_eta": sum(v for v in per_job.values() if v) if speed else None,
+            "total_eta": total_secs / speed if speed and total_secs else None,
+        }
+
     def state(self):
         cfg = self.config
         target = cfg["target_height"]
         titles = self.library.summaries(target)
+        jobs = self.jobs.state()
         ratio = self.jobs.size_ratio()
         to_encode = sum(t["above_size"] for t in titles)
         lib = self.library
@@ -818,7 +886,8 @@ class App:
                 "size_ratio": ratio,
                 "saved_mb": self.jobs.saved_total_mb(),
             },
-            "jobs": self.jobs.state(),
+            "jobs": jobs,
+            "eta": self.queue_eta(jobs, titles),
             "external": external_encodes(),
             "schedule": {"hours": cfg["encode_hours"], "open": in_window(cfg["encode_hours"]),
                          "server_time": time.strftime("%H:%M")},
