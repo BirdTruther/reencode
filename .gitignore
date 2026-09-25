@@ -2,3 +2,6 @@ reencode.conf
 .encodetv_cache
 *.log
 *.bak
+.dashboard_cache.*
+.dashboard_history.*
+__pycache__/
