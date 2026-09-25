@@ -248,31 +248,32 @@ def group_key(base):
 
 
 def plan_files(files, target, keep_4k, skip):
-    """Same rules as plan_title() in common.sh. files: dicts with "name" and
-    "height". Returns [(action, reason)] in the same order."""
+    """Same rules as plan_title() in common.sh. files: dicts with "name",
+    "height" and "cls". Returns [(action, reason)] in the same order."""
     keys = [group_key(os.path.splitext(f["name"])[0]) for f in files]
     versions, small = collections.Counter(keys), {}
     for f, k in zip(files, keys):
+        # Stored height, not class: files already shrunk by height count as done.
         if f["height"] and f["height"] <= target:
-            small[k] = f["height"]
+            small[k] = res_label(f.get("cls"))
     out, best = [], {}
     for i, (f, k) in enumerate(zip(files, keys)):
-        h = f["height"]
+        h, cls = f["height"], f.get("cls") or 0
         if not h:
             out.append(("unknown", "can't read the video"))
         elif h <= target:
-            out.append(("ok", f"already {h}p"))
+            out.append(("ok", f"already {res_label(cls)}"))
         elif skip:
             out.append(("skip", "set to never shrink"))
-        elif h >= 2160 and keep_4k == "yes":
+        elif cls >= 1800 and keep_4k == "yes":
             out.append(("keep4k", "keeping 4K"))
-        elif h >= 2160 and keep_4k == "if-other-version" and versions[k] > 1:
+        elif cls >= 1800 and keep_4k == "if-other-version" and versions[k] > 1:
             out.append(("keep4k", "keeping 4K, another version exists"))
         elif k in small:
-            out.append(("extra", f"a {small[k]}p version already exists"))
+            out.append(("extra", f"a {small[k]} version already exists"))
         else:
             out.append(("encode", f"shrink to {target}p"))
-            if k not in best or h > files[best[k]]["height"]:
+            if k not in best or cls > (files[best[k]].get("cls") or 0):
                 best[k] = i
     for i, k in enumerate(keys):
         if out[i][0] == "encode" and best[k] != i:
@@ -345,23 +346,65 @@ def in_window(spec, t=None):
 
 # ── Library scanning ───────────────────────────────────────────────────────
 
+PROBE_VERSION = 2  # bump when ffprobe() starts returning new fields
+
+
+def res_class(width, height, sar):
+    """(display width, resolution class). Same as probe_video() in common.sh:
+    the class is the 16:9-equivalent height, so 3840x1600 is 2160 (4K)."""
+    dw = width
+    num, _, den = str(sar or "").partition(":")
+    if num.isdigit() and den.isdigit() and int(num) > 0 and int(den) > 0:
+        dw = (width * int(num) + int(den) // 2) // int(den)
+    return dw, max(height, (dw * 9 + 8) // 16)
+
+
+def res_label(cls):
+    if not cls:
+        return "?"
+    if cls >= 1800:
+        return "4K"
+    if cls >= 1300:
+        return "1440p"
+    if cls >= 900:
+        return "1080p"
+    if cls >= 650:
+        return "720p"
+    return f"{cls}p"
+
+
 def ffprobe(path):
+    """Main video stream: the largest one that isn't cover art (the first video
+    stream can be cover art or a Dolby Vision 1080p layer)."""
+    empty = {"height": None, "width": None, "cls": None, "codec": None, "duration": None,
+             "v": PROBE_VERSION}
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=height,codec_name:format=duration",
+            ["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=index,codec_name,width,height,sample_aspect_ratio"
+             ":stream_disposition=attached_pic:format=duration",
              "-of", "json", path],
             capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
         ).stdout
         data = json.loads(out or b"{}")
     except (subprocess.SubprocessError, ValueError, OSError):
-        return {"height": None, "codec": None, "duration": None}
-    stream = (data.get("streams") or [{}])[0]
+        return empty
+    best = None
+    for st in data.get("streams") or []:
+        w, h = st.get("width") or 0, st.get("height") or 0
+        if w <= 0 or h <= 0 or (st.get("disposition") or {}).get("attached_pic"):
+            continue
+        if best is None or w * h > best["width"] * best["height"]:
+            best = st
     try:
         duration = float(data.get("format", {}).get("duration"))
     except (TypeError, ValueError):
         duration = None
-    return {"height": stream.get("height"), "codec": stream.get("codec_name"), "duration": duration}
+    if not best:
+        return dict(empty, duration=duration)
+    dw, cls = res_class(best["width"], best["height"], best.get("sample_aspect_ratio"))
+    return {"height": best["height"], "width": best["width"], "cls": cls,
+            "codec": best.get("codec_name"), "duration": duration, "v": PROBE_VERSION}
 
 
 class Library:
@@ -448,7 +491,8 @@ class Library:
         for lib, files in found.values():
             for full, size, mtime in files:
                 c = self.cache.get(full)
-                if not c or c.get("size") != size or c.get("mtime") != mtime:
+                if (not c or c.get("size") != size or c.get("mtime") != mtime
+                        or c.get("v") != PROBE_VERSION):
                     todo.append((full, size, mtime))
 
         with self.lock:
@@ -479,6 +523,9 @@ class Library:
                         "rel": os.path.relpath(full, tpath),
                         "size": size,
                         "height": c.get("height"),
+                        "width": c.get("width"),
+                        "cls": c.get("cls"),
+                        "res": res_label(c.get("cls")),
                         "codec": c.get("codec"),
                         "duration": c.get("duration"),
                     })
@@ -522,7 +569,7 @@ class Library:
                     unknown += 1
                 else:
                     done += 1
-                if f["height"] == ts["height"]:
+                if f.get("cls") == ts["height"]:
                     at += 1
             if ts["skip"]:
                 status = "skipped"

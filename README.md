@@ -89,6 +89,8 @@ Each profile also decides what happens to **4K files**:
 - **Keep if another version**: if a folder has the same movie in 4K and another resolution (e.g. `Movie (2020) - 2160p.mkv` and `Movie (2020) - 1080p.mkv`), the 4K is left alone and only the other copy is shrunk. A 4K file on its own is still shrunk.
 - **Always keep**: 4K files are never touched.
 
+Resolution is judged the way Plex shows it: widescreen films count by their width, so a 3840×1600 movie is 4K and a 1920×800 one is 1080p. Shrinking keeps the shape of the picture, so a 2.40:1 movie at 720p becomes 1280×534, not a squashed or oversized 16:9 frame. Files with extra video streams (cover art, or the second layer of a Dolby Vision file) are judged by their main picture.
+
 When a folder has several versions of the same video, only one of them is ever shrunk, so they can't overwrite each other. If a small enough version already exists, the others are left as they are.
 
 **Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer.

@@ -112,7 +112,7 @@ setup_dirs() {
 }
 
 get_video_codec() {
-    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -1
+    ffprobe -v error -select_streams "${2:-v:0}" -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -1
 }
 
 get_duration() {
@@ -125,35 +125,52 @@ get_file_size_mb() {
     echo $(( size_bytes / 1024 / 1024 ))
 }
 
-# Sets ENC_PRE (before -i), ENC_VF (filter chain) and ENC_V (video codec args)
-# for CPU decoding, and GPU_PRE/GPU_VF for decoding + scaling on the GPU too.
+# Sets ENC_PRE (before -i) and ENC_V (video codec args) for CPU decoding, and
+# GPU_PRE for decoding on the GPU too. Scale filters are per file: set_filters.
 setup_encoder() {
     GPU_PRE=()
-    GPU_VF=""
     case "$ENCODER" in
         vaapi)
             ENC_PRE=(-vaapi_device "$VAAPI_DEVICE")
-            ENC_VF="scale=-2:${TARGET_HEIGHT},format=nv12,hwupload"
             GPU_PRE=(-hwaccel vaapi -hwaccel_device "$VAAPI_DEVICE" -hwaccel_output_format vaapi)
-            GPU_VF="scale_vaapi=w=-2:h=${TARGET_HEIGHT}:format=nv12"
             ENC_V=(-c:v hevc_vaapi -qp "$QUALITY")
             ENC_NAME=hevc_vaapi ;;
         nvenc)
             ENC_PRE=()
-            ENC_VF="scale=-2:${TARGET_HEIGHT}"
             GPU_PRE=(-hwaccel cuda -hwaccel_output_format cuda)
-            GPU_VF="scale_cuda=-2:${TARGET_HEIGHT}"
             ENC_V=(-c:v hevc_nvenc -preset p5 -rc vbr -cq "$QUALITY" -b:v 0)
             ENC_NAME=hevc_nvenc ;;
         software)
             ENC_PRE=()
-            ENC_VF="scale=-2:${TARGET_HEIGHT}"
             ENC_V=(-c:v libx265 -preset medium -crf "$QUALITY" -x265-params log-level=error)
             ENC_NAME=libx265 ;;
         *)
             log_err "Unknown ENCODER '$ENCODER' (use vaapi, nvenc or software)"
             exit 1 ;;
     esac
+}
+
+# Scale filters for one file's output size: ENC_VF (CPU decode) and GPU_VF
+# (GPU decode + scale; empty when there's no GPU path).
+set_filters() {
+    local ow="$1" oh="$2"
+    case "$ENCODER" in
+        vaapi)
+            ENC_VF="scale=${ow}:${oh},format=nv12,hwupload"
+            GPU_VF="scale_vaapi=w=${ow}:h=${oh}:format=nv12" ;;
+        nvenc)
+            ENC_VF="scale=${ow}:${oh}"
+            GPU_VF="scale_cuda=${ow}:${oh}" ;;
+        *)
+            ENC_VF="scale=${ow}:${oh}"
+            GPU_VF="" ;;
+    esac
+}
+
+# Size a source should be shrunk to under the current profile (sets OUT_W, OUT_H).
+output_dims() {
+    probe_video "$1" || return 1
+    read -r OUT_W OUT_H < <(target_dims "$V_W" "$V_H" "$V_DW" "$TARGET_HEIGHT")
 }
 
 check_encoder() {
@@ -175,10 +192,14 @@ check_encoder() {
 
 # Confirm an encode is complete: right height and same length as the source.
 verify_output() {
-    local src="$1" out="$2" h sd od
-    h=$(get_video_height "$out")
-    if [[ "$h" != "$TARGET_HEIGHT" ]]; then
-        log_err "VERIFY FAILED: $(basename "$out") is ${h:-?}p, expected ${TARGET_HEIGHT}p"
+    local src="$1" out="$2" sd od
+    if ! output_dims "$src"; then
+        log_err "VERIFY FAILED: can't read the source video $(basename "$src")"
+        return 1
+    fi
+    if ! probe_video "$out" || [ "${V_W:-0}" -lt $((OUT_W - 2)) ] || [ "$V_W" -gt $((OUT_W + 2)) ] \
+        || [ "$V_H" -lt $((OUT_H - 2)) ] || [ "$V_H" -gt $((OUT_H + 2)) ]; then
+        log_err "VERIFY FAILED: $(basename "$out") is ${V_W:-?}x${V_H:-?}, expected ${OUT_W}x${OUT_H}"
         return 1
     fi
     od=$(get_duration "$out")
@@ -216,7 +237,9 @@ encode_file() {
 
     height=${HEIGHTS["$input"]:-}
     if [[ "${PLAN["$input"]:-}" != encode ]]; then
-        log_warn "SKIP (${WHY["$input"]:-nothing to do}): $filename [${height:-?}p, ${original_size_mb}MB]"
+        local res="?"
+        [[ -n "$height" ]] && res="$(res_label "${CLASSES["$input"]}") ${WIDTHS["$input"]}x${height}"
+        log_warn "SKIP (${WHY["$input"]:-nothing to do}): $filename [${res}, ${original_size_mb}MB]"
         return 2
     fi
 
@@ -225,7 +248,7 @@ encode_file() {
         return 2
     fi
 
-    codec=$(get_video_codec "$input")
+    codec=$(get_video_codec "$input" "${STREAMS["$input"]:-v:0}")
 
     if [[ "$DRY_RUN" == true ]]; then
         local target_size_mb=$(( original_size_mb * 60 / 100 ))
@@ -242,8 +265,15 @@ encode_file() {
         rm -f "$outfile"
     fi
 
+    if ! output_dims "$input"; then
+        log_err "FAILED: can't read the video in $filename"
+        return 1
+    fi
+    set_filters "$OUT_W" "$OUT_H"
+    local stream=${STREAMS["$input"]:-$V_INDEX}
+
     duration=$(get_duration "$input")
-    log "Encoding: $filename [${height}p, ${codec}, ${original_size_mb}MB]"
+    log "Encoding: $filename [$(res_label "${CLASSES["$input"]:-$height}") ${WIDTHS["$input"]:-?}x${height}, ${codec}, ${original_size_mb}MB] -> ${OUT_W}x${OUT_H}"
     log "  Duration: ${duration:-?}s"
     log "  Output: $outfile"
 
@@ -278,7 +308,7 @@ encode_file() {
         if ffmpeg -nostdin -hide_banner -loglevel warning -stats -y \
             "${pre[@]}" \
             -i "$input" \
-            -map 0:v:0 -map '0:a?' -map '0:s?' -map '0:t?' \
+            -map "0:${stream}" -map '0:a?' -map '0:s?' -map '0:t?' \
             -c copy \
             -vf "$vf" \
             "${ENC_V[@]}" \
@@ -308,7 +338,7 @@ encode_file() {
         [[ "$original_size_mb" -gt 0 ]] && savings=$(( (original_size_mb - new_size_mb) * 100 / original_size_mb ))
 
         log_ok "Encoded: $filename -> ${new_size_mb}MB (${savings}% saved, ${elapsed}s)"
-        log_ok "Verified: $(basename "$outfile") is ${TARGET_HEIGHT}p, full length"
+        log_ok "Verified: $(basename "$outfile") is ${OUT_W}x${OUT_H}, full length"
         return 0
     else
         log_err "FAILED: $filename (see $logfile)"
@@ -418,7 +448,9 @@ title_files() {
 print_plan() {
     local f
     for f in "${TITLE_FILES[@]}"; do
-        printf '%s\t%s\t%s\t%s\n' "${PLAN["$f"]}" "${HEIGHTS["$f"]:-?}" "${WHY["$f"]}" "$f"
+        local res="?"
+        [[ -n "${HEIGHTS["$f"]}" ]] && res="$(res_label "${CLASSES["$f"]}") ${WIDTHS["$f"]}x${HEIGHTS["$f"]}"
+        printf '%s\t%s\t%s\t%s\n' "${PLAN["$f"]}" "$res" "${WHY["$f"]}" "$f"
     done
 }
 
