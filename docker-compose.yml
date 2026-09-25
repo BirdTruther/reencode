@@ -1,8 +1,7 @@
 services:
   reencode:
-    build: .
-    # Or use the prebuilt image instead of building (see README):
-    # image: ghcr.io/birdtruther/reencode:latest
+    image: ghcr.io/birdtruther/reencode:latest
+    # build: .                         # or build it yourself from this repo instead
     container_name: reencode
     restart: unless-stopped
     ports:

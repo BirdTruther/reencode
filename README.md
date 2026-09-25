@@ -12,18 +12,26 @@ Pick one. All three give you the dashboard on port **8686**, and none needs a se
 
 ### Docker (easiest)
 
-Edit the paths in [`docker-compose.yml`](docker-compose.yml) (your TV/Movies folders, a scratch folder, `PUID`/`PGID` = the owner of your media, your timezone), then:
+The image is published as `ghcr.io/birdtruther/reencode:latest` (amd64 + arm64), so you don't need to clone or build anything. Copy [`docker-compose.yml`](docker-compose.yml), edit the paths (your TV/Movies folders, a scratch folder, `PUID`/`PGID` = the owner of your media, your timezone), then:
 
 ```bash
-git clone https://github.com/BirdTruther/reencode
-cd reencode
 docker compose up -d
 docker logs reencode        # shows the generated password
 ```
 
+**Cosmos, Portainer, Unraid, etc.:** paste the compose file into their compose/stack import, or create a container by hand with:
+
+| Setting | Value |
+|---|---|
+| Image | `ghcr.io/birdtruther/reencode:latest` |
+| Port | `8686` |
+| Device | `/dev/dri` (Intel/AMD GPU) |
+| Env | `PUID`, `PGID` (owner of your media, see `id`), `TZ` (e.g. `America/New_York`) |
+| Volumes | `/config` (settings, keep it), `/transcode` (scratch space), your libraries under `/media/...` (e.g. `/media/TV`, `/media/Movies`) |
+
 The image includes ffmpeg and the AMD and Intel GPU drivers. It runs as `PUID`/`PGID` so replaced files keep the right owner, and it joins the GPU's group automatically. Settings, history and logs live in `./config`.
 
-A prebuilt image (`ghcr.io/birdtruther/reencode:latest`, amd64 + arm64) is published by CI from `main`. To use it, swap `build: .` for the `image:` line in the compose file.
+To build the image yourself instead, clone the repo and swap the `image:` line in the compose file for `build: .`.
 
 ### As a service (no Docker)
 
