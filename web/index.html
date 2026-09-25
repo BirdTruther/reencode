@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reencode</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2314b8a6'/><path d='M9 11h14M9 16h10M9 21h6' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --border: #e3e6eb;
+  --text: #16181d; --muted: #667085; --faint: #98a2b3;
+  --accent: #0d9488; --accent-2: #14b8a6; --accent-soft: #ccfbf1; --on-accent: #fff;
+  --ok: #16a34a; --ok-soft: #dcfce7; --warn: #d97706; --warn-soft: #fef3c7;
+  --info: #2563eb; --info-soft: #dbeafe; --err: #dc2626; --err-soft: #fee2e2;
+  --bar: #e5e7eb; --shadow: 0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1016; --panel: #151922; --panel-2: #1b202b; --border: #262c38;
+    --text: #e6e9ef; --muted: #98a2b3; --faint: #667085;
+    --accent: #2dd4bf; --accent-2: #14b8a6; --accent-soft: #0f2f2c; --on-accent: #042f2e;
+    --ok: #4ade80; --ok-soft: #10291a; --warn: #fbbf24; --warn-soft: #2f2410;
+    --info: #60a5fa; --info-soft: #132338; --err: #f87171; --err-soft: #331616;
+    --bar: #262c38; --shadow: none; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1016; --panel: #151922; --panel-2: #1b202b; --border: #262c38;
+  --text: #e6e9ef; --muted: #98a2b3; --faint: #667085;
+  --accent: #2dd4bf; --accent-2: #14b8a6; --accent-soft: #0f2f2c; --on-accent: #042f2e;
+  --ok: #4ade80; --ok-soft: #10291a; --warn: #fbbf24; --warn-soft: #2f2410;
+  --info: #60a5fa; --info-soft: #132338; --err: #f87171; --err-soft: #331616;
+  --bar: #262c38; --shadow: none; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px; }
+
+/* header */
+header { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+header .wrap { display: flex; align-items: center; gap: 12px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 16px; letter-spacing: -.01em; }
+.brand-mark { width: 28px; height: 28px; border-radius: 8px; background: var(--accent-2); display: grid; place-items: center; }
+.brand small { color: var(--muted); font-weight: 500; font-size: 13px; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.dot.live { background: var(--accent); box-shadow: 0 0 0 0 var(--accent); animation: pulse 1.6s infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 60%, transparent); } 100% { box-shadow: 0 0 0 7px transparent; } }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--panel); cursor: pointer; font-weight: 550;
+  font-size: 13px; white-space: nowrap; transition: background .12s, border-color .12s; }
+.btn:hover { background: var(--panel-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.danger { color: var(--err); }
+.btn.danger:hover { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; }
+.btn.ghost { border-color: transparent; background: transparent; }
+.btn.ghost:hover { background: var(--panel-2); }
+.btn svg { width: 15px; height: 15px; }
+.icon-btn { width: 32px; padding: 0; }
+
+main.wrap { padding: 20px 16px 60px; display: grid; gap: 20px; }
+main > * { min-width: 0; }
+#banners { display: grid; gap: 10px; }
+#banners:empty { display: none; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
+.card-h { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.card-h h2 { margin: 0; font-size: 14px; font-weight: 650; }
+.card-b { padding: 16px; }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+
+/* stats */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.stat { padding: 14px 16px; }
+.stat .k { color: var(--muted); font-size: 12.5px; font-weight: 550; }
+.stat .v { font-size: 24px; font-weight: 680; letter-spacing: -.02em; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.stat .s { color: var(--faint); font-size: 12.5px; margin-top: 1px; }
+.stat.hl .v { color: var(--accent); }
+
+/* now encoding */
+.now { padding: 18px; display: grid; gap: 14px; }
+.now-top { display: flex; gap: 12px; align-items: flex-start; }
+.eyebrow { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; font-weight: 650; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+.now-title { font-size: 20px; font-weight: 680; letter-spacing: -.015em; margin-top: 2px; word-break: break-word; }
+.now-file { color: var(--muted); margin-top: 2px; word-break: break-all; }
+.bar { height: 8px; background: var(--bar); border-radius: 999px; overflow: hidden; position: relative; }
+.bar > i { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: inherit; transition: width .6s ease; }
+.bar.thin { height: 5px; }
+.bar.indet > i { width: 30% !important; animation: indet 1.3s ease-in-out infinite; }
+@keyframes indet { 0% { left: -30%; } 100% { left: 100%; } }
+.bar-row { display: grid; gap: 6px; }
+.bar-meta { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+.bar-meta b { color: var(--text); font-weight: 650; }
+.idle { padding: 22px 18px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.idle-ico { width: 40px; height: 40px; border-radius: 10px; background: var(--panel-2); display: grid; place-items: center; color: var(--muted); flex: none; }
+.idle-t { font-weight: 620; }
+.banner { padding: 10px 14px; border-radius: 10px; background: var(--warn-soft); color: var(--text); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); font-size: 13px; }
+.banner.err { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, transparent); }
+
+.log { background: #0b0e14; color: #cdd5e0; font-family: var(--mono); font-size: 12px; line-height: 1.55;
+  border-radius: 10px; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.log .ok { color: #4ade80; } .log .warn { color: #fbbf24; } .log .err { color: #f87171; } .log .dim { color: #6b7280; }
+details.logwrap > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; list-style: none; display: inline-flex; gap: 6px; align-items: center; user-select: none; }
+details.logwrap > summary::-webkit-details-marker { display: none; }
+details.logwrap > summary::before { content: "▸"; transition: transform .15s; display: inline-block; }
+details.logwrap[open] > summary::before { transform: rotate(90deg); }
+details.logwrap[open] > summary { margin-bottom: 8px; }
+
+/* queue */
+.qlist { list-style: none; margin: 0; padding: 0; }
+.qlist li { display: flex; align-items: center; gap: 10px; padding: 9px 16px; border-top: 1px solid var(--border); }
+.qlist li:first-child { border-top: 0; }
+.qnum { width: 22px; height: 22px; border-radius: 6px; background: var(--panel-2); color: var(--muted); font-size: 12px; display: grid; place-items: center; flex: none; font-weight: 600; }
+.qname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* library */
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.tabs { display: flex; gap: 2px; background: var(--panel-2); padding: 3px; border-radius: 9px; border: 1px solid var(--border); }
+.tab { border: 0; background: transparent; padding: 4px 11px; border-radius: 6px; cursor: pointer; color: var(--muted); font-weight: 550; font-size: 13px; }
+.tab[aria-selected="true"] { background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+.tab .n { color: var(--faint); font-weight: 500; margin-left: 4px; font-variant-numeric: tabular-nums; }
+.search { position: relative; flex: 1; min-width: 160px; max-width: 320px; }
+.search input { width: 100%; height: 32px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); padding: 0 10px 0 32px; outline: none; }
+.search input:focus, .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.search svg { position: absolute; left: 10px; top: 9px; width: 14px; height: 14px; color: var(--faint); }
+select.plain { height: 32px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); padding: 0 8px; }
+
+table.lib { width: 100%; border-collapse: collapse; }
+table.lib th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 9px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.lib td { padding: 10px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+table.lib tr.row:hover td { background: color-mix(in srgb, var(--panel-2) 60%, transparent); }
+table.lib tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tname { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.expander { border: 0; background: none; cursor: pointer; padding: 2px; color: var(--faint); border-radius: 4px; display: grid; place-items: center; flex: none; }
+.expander:hover { color: var(--text); background: var(--panel-2); }
+.expander svg { width: 14px; height: 14px; transition: transform .15s; }
+.expander[aria-expanded="true"] svg { transform: rotate(90deg); }
+.tname-t { font-weight: 560; overflow: hidden; text-overflow: ellipsis; }
+.libtag { font-size: 11px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 0 6px; white-space: nowrap; }
+.prog { display: flex; align-items: center; gap: 10px; min-width: 150px; }
+.seg { flex: 1; display: flex; height: 6px; border-radius: 99px; overflow: hidden; background: var(--bar); min-width: 60px; }
+.seg i { display: block; height: 100%; }
+.seg .d { background: var(--ok); } .seg .t { background: var(--warn); }
+.prog .c { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.b-ready { background: var(--warn-soft); color: var(--warn); }
+.b-partial { background: var(--info-soft); color: var(--info); }
+.b-done { background: var(--ok-soft); color: var(--ok); }
+.b-na { background: var(--panel-2); color: var(--muted); }
+.b-run { background: var(--accent-soft); color: var(--accent); }
+.b-queued { background: var(--panel-2); color: var(--text); }
+.b-failed { background: var(--err-soft); color: var(--err); }
+.acts { display: flex; gap: 6px; justify-content: flex-end; }
+tr.detail td { background: var(--panel-2); padding: 0; }
+.files { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.lib .files td { padding: 6px 16px 6px 46px; border-bottom: 1px solid var(--border); background: none; }
+table.lib .files td + td { padding-left: 12px; }
+table.lib .files tr:last-child td { border-bottom: 0; }
+.res { font-weight: 650; font-variant-numeric: tabular-nums; }
+.res.hi { color: var(--warn); } .res.ok { color: var(--ok); } .res.lo { color: var(--muted); }
+.empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+.empty b { color: var(--text); display: block; margin-bottom: 4px; font-size: 15px; }
+.lib-foot { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; }
+
+/* history */
+.hist { list-style: none; padding: 0; margin: 0; }
+.hist li { display: grid; grid-template-columns: auto 1fr auto auto; gap: 12px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--border); }
+.hist li:first-child { border-top: 0; }
+.hist .hn { font-weight: 560; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist .hs { color: var(--muted); font-size: 12.5px; }
+.hist .ht { color: var(--faint); font-size: 12.5px; white-space: nowrap; }
+
+/* dialogs */
+dialog { border: 1px solid var(--border); border-radius: 14px; padding: 0; background: var(--panel); color: var(--text);
+  width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 40px); box-shadow: 0 20px 50px rgba(0,0,0,.25); }
+dialog.wide { width: min(900px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
+.dlg-h { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); gap: 10px; }
+.dlg-h h3 { margin: 0; font-size: 15px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dlg-b { padding: 18px; display: grid; gap: 14px; overflow: auto; max-height: calc(100vh - 170px); }
+.dlg-f { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--border); }
+.field { display: grid; gap: 5px; align-content: start; }
+.field label { font-weight: 600; font-size: 13px; }
+.field .hint { color: var(--muted); font-size: 12.5px; }
+.field .error { color: var(--err); font-size: 12.5px; }
+.field input, .field select, .field textarea { height: 34px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); padding: 0 10px; outline: none; width: 100%; }
+.field textarea { height: auto; min-height: 76px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+.field.bad input, .field.bad textarea, .field.bad select { border-color: var(--err); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+#toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 50; width: min(420px, calc(100vw - 32px)); }
+.toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.2); animation: tin .2s ease; }
+.toast.err { background: var(--err); color: #fff; }
+@keyframes tin { from { opacity: 0; transform: translateY(6px); } }
+
+.hide-sm { }
+@media (max-width: 860px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .hide-md { display: none; }
+}
+@media (max-width: 640px) {
+  .hide-sm { display: none; }
+  header .wrap { gap: 8px; }
+  .brand small { display: none; }
+  .stat .v { font-size: 20px; }
+  table.lib th, table.lib td { padding-left: 12px; padding-right: 12px; }
+  .prog { min-width: 64px; }
+  .seg { min-width: 40px; }
+  .prog .c { display: none; }
+  .acts .btn:not(.primary) { display: none; }
+  .row2 { grid-template-columns: 1fr; }
+  .hist li { grid-template-columns: auto 1fr auto; }
+  .hist .ht { display: none; }
+  table.lib .files td { padding-left: 12px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">
+      <div class="brand-mark"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M3 4.5h10M3 8h7M3 11.5h4" stroke="white" stroke-width="2" stroke-linecap="round"/></svg></div>
+      <span>Reencode <small id="cfgline"></small></span>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill hide-sm" id="scanpill"><span class="dot"></span><span>Loading…</span></span>
+    <button class="btn icon-btn ghost" id="rescanBtn" title="Rescan library" aria-label="Rescan library">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
+    <button class="btn" id="settingsBtn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span class="hide-sm">Settings</span>
+    </button>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="stats">
+    <div class="card stat"><div class="k">Library</div><div class="v" id="stLib">–</div><div class="s" id="stLibS">&nbsp;</div></div>
+    <div class="card stat"><div class="k">Still to encode</div><div class="v" id="stTodo">–</div><div class="s" id="stTodoS">&nbsp;</div></div>
+    <div class="card stat"><div class="k">Could still save</div><div class="v" id="stEst">–</div><div class="s" id="stEstS">&nbsp;</div></div>
+    <div class="card stat hl"><div class="k">Saved so far</div><div class="v" id="stSaved">–</div><div class="s" id="stSavedS">&nbsp;</div></div>
+  </section>
+
+  <div id="banners"></div>
+
+  <section class="card" id="nowCard"></section>
+
+  <section class="card" id="queueCard" hidden>
+    <div class="card-h"><h2>Up next</h2><span class="muted" id="queueCount"></span></div>
+    <ul class="qlist" id="queueList"></ul>
+  </section>
+
+  <section class="card">
+    <div class="card-h" style="border-bottom:0;padding-bottom:4px">
+      <h2>Library</h2>
+      <div class="spacer"></div>
+      <button class="btn sm" id="queueVisibleBtn" disabled>Encode all shown</button>
+    </div>
+    <div class="toolbar">
+      <div class="tabs" id="libTabs" role="tablist"></div>
+      <div class="tabs" id="statusTabs" role="tablist"></div>
+      <label class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="search" type="search" placeholder="Search titles" autocomplete="off">
+      </label>
+      <select class="plain" id="sort" aria-label="Sort">
+        <option value="name">Name</option>
+        <option value="save">Biggest savings</option>
+        <option value="size">Size</option>
+        <option value="todo">Most to encode</option>
+      </select>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="lib">
+        <thead><tr>
+          <th>Title</th>
+          <th>Progress</th>
+          <th class="num hide-sm">Size</th>
+          <th class="num hide-md">Est. saving</th>
+          <th>Status</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="libBody"></tbody>
+      </table>
+    </div>
+    <div class="lib-foot" id="libFoot"></div>
+  </section>
+
+  <section class="card" id="histCard" hidden>
+    <div class="card-h"><h2>Recent jobs</h2></div>
+    <ul class="hist" id="histList"></ul>
+  </section>
+</main>
+
+<dialog id="settingsDlg">
+  <form method="dialog" id="settingsForm" novalidate>
+    <div class="dlg-h"><h3>Settings</h3><button class="btn icon-btn ghost" value="cancel" aria-label="Close">✕</button></div>
+    <div class="dlg-b">
+      <div class="field" data-f="libraries">
+        <label for="f_libraries">Libraries</label>
+        <textarea id="f_libraries" name="libraries" rows="3" placeholder="/mnt/media/TV&#10;/mnt/media/Movies"></textarea>
+        <div class="hint">One folder per line. Each should contain show or movie folders, e.g. <span class="mono">TV/Show Name/…</span> or <span class="mono">Movies/Movie Name (2020)/…</span></div>
+      </div>
+      <div class="row2">
+        <div class="field" data-f="target_height">
+          <label for="f_target_height">Target resolution</label>
+          <select id="f_target_height" name="target_height">
+            <option value="480">480p</option><option value="540">540p</option><option value="576">576p</option>
+            <option value="720">720p</option><option value="1080">1080p</option><option value="1440">1440p</option>
+          </select>
+          <div class="hint">Anything taller gets downscaled to this.</div>
+        </div>
+        <div class="field" data-f="encoder">
+          <label for="f_encoder">Encoder</label>
+          <select id="f_encoder" name="encoder">
+            <option value="vaapi">VAAPI (Intel / AMD GPU)</option>
+            <option value="nvenc">NVENC (NVIDIA GPU)</option>
+            <option value="software">Software (CPU, slow)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field" data-f="quality">
+          <label for="f_quality">Quality</label>
+          <input id="f_quality" name="quality" type="number" min="0" max="51" step="1">
+          <div class="hint" id="qualityHint"></div>
+        </div>
+        <div class="field" data-f="vaapi_device">
+          <label for="f_vaapi_device">VAAPI device</label>
+          <input id="f_vaapi_device" name="vaapi_device" placeholder="auto-detect">
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field" data-f="hw_decode">
+          <label for="f_hw_decode">GPU decoding</label>
+          <select id="f_hw_decode" name="hw_decode">
+            <option value="auto">On, fall back to CPU if needed</option>
+            <option value="no">Off (decode on CPU)</option>
+          </select>
+          <div class="hint">Decoding on the GPU too is faster and frees up the CPU.</div>
+        </div>
+        <div class="field" data-f="encode_hours">
+          <label for="f_encode_hours">Encoding hours</label>
+          <input id="f_encode_hours" name="encode_hours" placeholder="any time, or e.g. 01:00-08:00">
+          <div class="hint" id="hoursHint">Outside these hours encodes pause and resume later.</div>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field" data-f="temp_dir">
+          <label for="f_temp_dir">Temp folder</label>
+          <input id="f_temp_dir" name="temp_dir">
+          <div class="hint">Encodes land here first. An SSD helps.</div>
+        </div>
+        <div class="field" data-f="log_dir">
+          <label for="f_log_dir">Log folder</label>
+          <input id="f_log_dir" name="log_dir">
+        </div>
+      </div>
+      <div class="hint">Saved to <span class="mono" id="cfgPath"></span>. Encoder changes apply from the next job; encoding hours apply right away.</div>
+    </div>
+    <div class="dlg-f">
+      <button class="btn" value="cancel">Cancel</button>
+      <button class="btn primary" id="saveSettings" value="default">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="logDlg" class="wide">
+  <div class="dlg-h"><h3 id="logTitle">Log</h3><button class="btn icon-btn ghost" onclick="this.closest('dialog').close()" aria-label="Close">✕</button></div>
+  <div class="dlg-b"><div class="log" id="logFull" style="max-height:60vh"></div></div>
+</dialog>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let S = null;                       // last /api/state
+const ui = load("ui", { lib: "all", status: "work", sort: "name", logOpen: false });
+const expanded = new Set();         // title paths
+const detailCache = new Map();      // path -> detail json
+let libKey = "";
+let liveLog = { id: null, seq: 0 };
+
+function load(k, d) { try { return Object.assign(d, JSON.parse(localStorage.getItem(k) || "{}")); } catch { return d; } }
+function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+
+function bytes(n) {
+  if (n == null) return "–";
+  const u = ["B","KB","MB","GB","TB","PB"]; let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i >= 3 ? n.toFixed(n < 10 ? 2 : n < 100 ? 1 : 0) : Math.round(n)) + " " + u[i];
+}
+const mb = n => bytes((n || 0) * 1048576);
+function dur(s) {
+  if (s == null || !isFinite(s)) return "–";
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${String(x).padStart(2, "0")}s` : `${x}s`;
+}
+function ago(t) {
+  const d = Date.now() / 1000 - t;
+  if (d < 60) return "just now";
+  if (d < 3600) return Math.floor(d / 60) + "m ago";
+  if (d < 86400) return Math.floor(d / 3600) + "h ago";
+  return new Date(t * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? "" : "s"}`;
+
+function toast(msg, err) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : "");
+  t.textContent = msg;
+  $("#toasts").append(t);
+  setTimeout(() => t.remove(), err ? 6000 : 3000);
+}
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(j.error || `HTTP ${r.status}`); e.data = j; e.status = r.status; throw e; }
+  return j;
+}
+
+/* ── polling ───────────────────────────────────────────── */
+async function refresh() {
+  try {
+    S = await api("/api/state");
+    render();
+  } catch (e) {
+    $("#scanpill").innerHTML = `<span class="dot" style="background:var(--err)"></span><span>Disconnected</span>`;
+  }
+}
+let timer;
+function schedule() {
+  clearTimeout(timer);
+  const busy = S && (S.jobs.current || S.scan.running);
+  timer = setTimeout(async () => { await refresh(); schedule(); }, document.hidden ? 15000 : busy ? 1500 : 4000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); schedule(); } });
+
+/* ── render ────────────────────────────────────────────── */
+function render() {
+  const c = S.config, st = S.stats;
+  $("#cfgline").textContent = `→ ${c.target_height}p HEVC · ${c.encoder}` + (c.encode_hours ? ` · ${c.encode_hours}` : "");
+
+  const sc = S.scan;
+  $("#scanpill").innerHTML = sc.running
+    ? `<span class="dot live"></span><span>Scanning${sc.total ? ` ${sc.done}/${sc.total}` : "…"}</span>`
+    : `<span class="dot" style="background:var(--ok)"></span><span>${sc.last ? "Scanned " + ago(sc.last) : "Idle"}</span>`;
+
+  $("#stLib").textContent = bytes(st.library_bytes);
+  $("#stLibS").textContent = `${plural(st.files, "file")} · ${plural(S.titles.length, "title")}`;
+  $("#stTodo").textContent = st.to_encode_files.toLocaleString();
+  $("#stTodoS").textContent = `files over ${c.target_height}p · ${bytes(st.to_encode_bytes)}`;
+  $("#stEst").textContent = "~" + bytes(st.est_savings_bytes);
+  $("#stEstS").textContent = `assuming ${Math.round((1 - st.size_ratio) * 100)}% smaller` + (st.size_ratio === 0.6 ? " (estimate)" : " (from your results)");
+  $("#stSaved").textContent = mb(st.saved_mb);
+  const done = S.jobs.history.filter(h => !h.dry_run && h.replaced > 0);
+  $("#stSavedS").textContent = done.length ? `across ${plural(done.length, "job")}` : "nothing replaced yet";
+
+  renderBanners();
+  renderNow();
+  renderQueue();
+  renderLibrary();
+  renderHistory();
+}
+
+function renderBanners() {
+  const b = [];
+  if (!S.config.libraries.length)
+    b.push(`<div class="banner">No libraries configured yet. <button class="btn sm" onclick="openSettings()">Open settings</button></div>`);
+  if (S.external.length)
+    b.push(`<div class="banner"><b>An encode started outside the dashboard is running.</b> Queued jobs will wait for it to finish.<div class="mono faint" style="margin-top:4px">${S.external.map(esc).join("<br>")}</div></div>`);
+  $("#banners").innerHTML = b.join("");
+}
+
+function renderNow() {
+  const j = S.jobs.current, el = $("#nowCard");
+  if (!j) {
+    liveLog.id = null;
+    const todo = S.titles.filter(t => t.above > 0).length;
+    el.innerHTML = `<div class="idle">
+      <div class="idle-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z" fill="currentColor"/></svg></div>
+      <div style="flex:1;min-width:200px"><div class="idle-t">${S.jobs.waiting_schedule ? `Waiting for encoding hours (${esc(S.config.encode_hours)})` : "Nothing encoding" + (S.jobs.waiting_external ? " (waiting for the other encode)" : "")}</div>
+      <div class="muted">${todo ? `${plural(todo, "title")} have files above ${S.config.target_height}p.` : S.titles.length ? "Everything is at or below the target. Nice." : "Waiting for the library scan."}</div></div>
+      ${todo ? `<button class="btn primary" onclick="queueWhere(t => t.above > 0)">Encode everything that needs it</button>` : ""}
+    </div>`;
+    return;
+  }
+  const filePct = j.file_pct, epDone = Math.max(0, j.episode - 1) + (filePct || 0);
+  const showPct = j.episodes ? epDone / j.episodes : 0;
+  const phase = j.file ? `Episode ${j.episode} of ${j.episodes}` : "Starting…";
+  let fileLine = "", fileBar = "";
+  const unit = j.episodes > 1 ? "episode" : "file";
+  const pctBar = (color, right) => `<div class="bar-row"><div class="bar"><i style="width:${(filePct * 100).toFixed(1)}%;background:${color}"></i></div>
+      <div class="bar-meta"><span><b>${Math.floor(filePct * 100)}%</b> this ${unit}</span><span>${right}</span></div></div>`;
+  if (j.dry_run) {
+    fileLine = "Preview only. Nothing will be encoded or replaced.";
+  } else if (j.paused) {
+    fileLine = j.paused_by === "schedule"
+      ? `Paused outside encoding hours (${esc(S.config.encode_hours)}). Picks up automatically.`
+      : "Paused. Nothing is encoding until you resume.";
+    if (filePct != null) fileBar = pctBar("var(--faint)", "paused");
+  } else if (filePct != null) {
+    const bits = [j.fps ? Math.round(j.fps) + " fps" : null, j.speed ? j.speed.toFixed(1) + "× realtime" : null, j.file_eta != null ? dur(j.file_eta) + " left" : null].filter(Boolean);
+    fileBar = pctBar("var(--accent)", bits.join(" · "));
+  } else if (j.file) {
+    fileBar = `<div class="bar-row"><div class="bar indet"><i></i></div><div class="bar-meta"><span>Checking / replacing…</span></div></div>`;
+  }
+  const replacing = j.replaced ? ` · replaced ${j.replaced}, saved ${mb(j.saved_mb)}` : "";
+  const failed = j.failures.length ? ` · <span style="color:var(--err)">${plural(j.failures.length, "failure")}</span>` : "";
+  const same = liveLog.id === j.id;
+  el.innerHTML = `<div class="now">
+    <div class="now-top">
+      <div style="flex:1;min-width:0">
+        <div class="eyebrow" ${j.paused ? 'style="color:var(--muted)"' : ""}><span class="dot ${j.paused ? "" : "live"}"></span>${j.paused ? "Paused" : j.dry_run ? "Previewing" : "Encoding"} · ${esc(libName(j.library))}</div>
+        <div class="now-title">${esc(j.name)}</div>
+        <div class="now-file">${j.file ? `${phase} · <span class="mono">${esc(j.file)}</span>` : phase}</div>
+      </div>
+      <div class="acts">
+        ${j.dry_run ? "" : j.paused
+          ? `<button class="btn primary" onclick="jobAction('${j.id}','resume')">Resume</button>`
+          : `<button class="btn" onclick="jobAction('${j.id}','pause')">Pause</button>`}
+        <button class="btn danger" onclick="cancelJob('${j.id}', true)">Stop</button>
+      </div>
+    </div>
+    ${fileLine ? `<div class="muted">${fileLine}</div>` : ""}
+    ${fileBar}
+    <div class="bar-row"><div class="bar thin"><i style="width:${(showPct * 100).toFixed(1)}%;background:var(--ok)"></i></div>
+      <div class="bar-meta"><span>${j.episodes ? `${Math.max(0, j.episode - 1)} of ${plural(j.episodes, "file")} done` : ""}${replacing}${failed}</span><span>running ${dur(Date.now() / 1000 - j.started)}</span></div></div>
+    <details class="logwrap" ${ui.logOpen ? "open" : ""}><summary>Live log</summary><div class="log" id="liveLog"></div></details>
+  </div>`;
+  const d = $("details.logwrap", el);
+  d.addEventListener("toggle", () => { ui.logOpen = d.open; save("ui", ui); if (d.open) pollLog(true); });
+  if (!same) liveLog = { id: j.id, seq: 0, lines: [] };
+  paintLog($("#liveLog"), liveLog.lines || []);
+  if (ui.logOpen) pollLog();
+}
+
+async function pollLog(force) {
+  const j = S && S.jobs.current;
+  if (!j || !ui.logOpen) return;
+  if (!force && liveLog.seq >= j.log_seq) return;
+  try {
+    const r = await api(`/api/jobs/${j.id}/log?since=${liveLog.seq}`);
+    if (liveLog.id !== j.id) return;
+    liveLog.lines = (liveLog.lines || []).concat(r.lines).slice(-1500);
+    liveLog.seq = r.seq;
+    const box = $("#liveLog");
+    if (box) paintLog(box, liveLog.lines);
+  } catch {}
+}
+
+function paintLog(box, lines) {
+  if (!box) return;
+  const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = lines.map(l => {
+    const cls = / ERR /.test(l) ? "err" : / WARN /.test(l) ? "warn" : / OK /.test(l) ? "ok" : /━━/.test(l) ? "dim" : "";
+    return cls ? `<span class="${cls}">${esc(l)}</span>` : esc(l);
+  }).join("\n") || `<span class="dim">Waiting for output…</span>`;
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function renderQueue() {
+  const q = S.jobs.queue;
+  $("#queueCard").hidden = !q.length;
+  $("#queueCount").textContent = q.length ? plural(q.length, "title") : "";
+  $("#queueList").innerHTML = q.map((j, i) => `<li>
+    <span class="qnum">${i + 1}</span>
+    <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}</span>
+    <button class="btn sm ghost icon-btn" title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""} onclick="moveJob('${j.id}','up')">↑</button>
+    <button class="btn sm ghost icon-btn" title="Move down" aria-label="Move down" ${i === q.length - 1 ? "disabled" : ""} onclick="moveJob('${j.id}','down')">↓</button>
+    <button class="btn sm ghost" onclick="cancelJob('${j.id}')">Remove</button>
+  </li>`).join("");
+}
+
+const libName = p => (p || "").split("/").filter(Boolean).pop() || p;
+const STATUS = {
+  work: { label: "Needs work", test: t => t.above > 0 },
+  done: { label: "Done", test: t => t.status === "done" },
+  all:  { label: "All", test: () => true },
+};
+
+function jobFor(path) {
+  const j = S.jobs.current;
+  if (j && j.path === path) return { state: "running", job: j };
+  const q = S.jobs.queue.find(q => q.path === path);
+  if (q) return { state: "queued", job: q };
+  return null;
+}
+
+function visibleTitles() {
+  const q = $("#search").value.trim().toLowerCase();
+  const v = S.titles.filter(t =>
+    (ui.lib === "all" || t.library === ui.lib) &&
+    STATUS[ui.status].test(t) &&
+    (!q || t.name.toLowerCase().includes(q)));
+  const by = {
+    name: (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }),
+    save: (a, b) => b.above_size - a.above_size,
+    size: (a, b) => b.size - a.size,
+    todo: (a, b) => b.above - a.above,
+  }[ui.sort];
+  return v.sort(by);
+}
+
+function renderLibrary() {
+  const libs = S.config.libraries;
+  if (ui.lib !== "all" && !libs.includes(ui.lib)) ui.lib = "all";
+  const count = l => S.titles.filter(t => l === "all" || t.library === l).length;
+  $("#libTabs").innerHTML = libs.length > 1
+    ? [["all", "All"], ...libs.map(l => [l, libName(l)])].map(([k, n]) =>
+        `<button class="tab" role="tab" aria-selected="${ui.lib === k}" data-lib="${esc(k)}">${esc(n)}<span class="n">${count(k)}</span></button>`).join("")
+    : "";
+  $("#libTabs").hidden = libs.length <= 1;
+  const inLib = S.titles.filter(t => ui.lib === "all" || t.library === ui.lib);
+  $("#statusTabs").innerHTML = Object.entries(STATUS).map(([k, s]) =>
+    `<button class="tab" role="tab" aria-selected="${ui.status === k}" data-status="${k}">${s.label}<span class="n">${inLib.filter(s.test).length}</span></button>`).join("");
+  $("#sort").value = ui.sort;
+
+  const v = visibleTitles();
+  const key = JSON.stringify([v.map(t => [t.path, t.above, t.at, t.files, t.size, t.status]), S.jobs.current?.path, S.jobs.current?.paused, S.jobs.queue.map(q => q.path), [...expanded], S.config.target_height, S.stats.size_ratio, libs.length]);
+  const q = v.filter(t => t.above > 0 && !jobFor(t.path));
+  $("#queueVisibleBtn").disabled = !q.length;
+  $("#queueVisibleBtn").textContent = q.length ? `Encode all shown (${q.length})` : "Encode all shown";
+  $("#libFoot").innerHTML = `<span>${plural(v.length, "title")} shown</span><span>Green = at ${S.config.target_height}p · amber = still to encode</span>`;
+  if (key === libKey) return;
+  libKey = key;
+
+  const body = $("#libBody");
+  if (!v.length) {
+    const scanning = S.scan.running;
+    body.innerHTML = `<tr><td colspan="6"><div class="empty">${
+      !S.titles.length ? (scanning ? "<b>Scanning your library…</b>This can take a while the first time." : "<b>No titles found.</b>Check your library folders in Settings.")
+      : ui.status === "work" ? "<b>Nothing left to encode here.</b>Switch to “All” to see everything." : "<b>No matches.</b>"}</div></td></tr>`;
+    return;
+  }
+  const ratio = S.stats.size_ratio, multi = libs.length > 1 && ui.lib === "all";
+  body.innerHTML = v.map(t => {
+    const j = jobFor(t.path), open = expanded.has(t.path);
+    const dPct = t.files ? t.at / t.files * 100 : 0, tPct = t.files ? t.above / t.files * 100 : 0;
+    const badge = j ? (j.state === "running" ? (j.job.paused ? `<span class="badge b-na">Paused</span>` : `<span class="badge b-run"><span class="dot live"></span>${j.job.dry_run ? "Previewing" : "Encoding"}</span>`) : `<span class="badge b-queued">Queued</span>`)
+      : { ready: `<span class="badge b-ready">To do</span>`, partial: `<span class="badge b-partial">Partial</span>`, done: `<span class="badge b-done">Done</span>`, "n/a": `<span class="badge b-na" title="All files are below the target resolution">Below target</span>` }[t.status];
+    const acts = j ? "" : t.above > 0
+      ? `<button class="btn sm" data-act="preview">Preview</button><button class="btn sm primary" data-act="encode">Encode</button>` : "";
+    return `<tr class="row" data-path="${esc(t.path)}">
+      <td><div class="tname"><button class="expander" data-act="expand" aria-expanded="${open}" aria-label="Show files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+        <span class="tname-t">${esc(t.name)}</span>${multi ? `<span class="libtag hide-sm">${esc(libName(t.library))}</span>` : ""}</div></td>
+      <td><div class="prog"><div class="seg"><i class="d" style="width:${dPct}%"></i><i class="t" style="width:${tPct}%"></i></div><span class="c">${t.at}/${t.files}</span></div></td>
+      <td class="num hide-sm">${bytes(t.size)}</td>
+      <td class="num hide-md">${t.above_size ? "~" + bytes(t.above_size * (1 - ratio)) : '<span class="faint">–</span>'}</td>
+      <td>${badge}</td>
+      <td><div class="acts">${acts}</div></td>
+    </tr>${open ? `<tr class="detail"><td colspan="6">${detailHtml(t.path)}</td></tr>` : ""}`;
+  }).join("");
+}
+
+function detailHtml(path) {
+  const d = detailCache.get(path);
+  if (!d) { loadDetail(path); return `<div class="empty" style="padding:14px">Loading…</div>`; }
+  const target = S.config.target_height;
+  return `<table class="files">${d.files.map(f => {
+    const cls = !f.height ? "lo" : f.height > target ? "hi" : f.height === target ? "ok" : "lo";
+    return `<tr><td class="mono" style="word-break:break-all">${esc(f.rel)}</td>
+      <td class="res ${cls}">${f.height ? f.height + "p" : "?"}</td>
+      <td class="muted hide-sm">${esc(f.codec || "")}</td>
+      <td class="num muted hide-sm">${dur(f.duration)}</td>
+      <td class="num">${bytes(f.size)}</td></tr>`;
+  }).join("")}</table>`;
+}
+
+async function loadDetail(path) {
+  try {
+    detailCache.set(path, await api("/api/title?path=" + encodeURIComponent(path)));
+  } catch { detailCache.set(path, { files: [] }); }
+  libKey = ""; renderLibrary();
+}
+
+function renderHistory() {
+  const h = S.jobs.history;
+  $("#histCard").hidden = !h.length;
+  $("#histList").innerHTML = h.slice(0, 15).map(j => {
+    const cls = { done: "b-done", failed: "b-failed", cancelled: "b-na" }[j.status] || "b-na";
+    const label = { done: j.dry_run ? "Previewed" : "Done", failed: "Failed", cancelled: "Stopped" }[j.status] || j.status;
+    let s = [];
+    if (j.dry_run) s.push("preview");
+    if (j.status === "cancelled") s.push(j.started ? "stopped before finishing" : "removed from queue");
+    if (j.replaced) s.push(`${plural(j.replaced, "file")} replaced, saved ${mb(j.saved_mb)}`);
+    else if (!j.dry_run && j.status === "done") s.push("nothing needed replacing");
+    if (j.failures && j.failures.length) s.push(`${plural(j.failures.length, "failure")}: ${j.failures.slice(0, 2).join(", ")}${j.failures.length > 2 ? "…" : ""}`);
+    if (j.status === "failed" && !(j.failures || []).length && j.returncode) s.push(`exit code ${j.returncode}, see log`);
+    const took = j.started && j.finished ? dur(j.finished - j.started) : "";
+    return `<li><span class="badge ${cls}">${label}</span>
+      <div style="min-width:0"><div class="hn">${esc(j.name)}</div><div class="hs">${esc(s.join(" · ")) || "&nbsp;"}</div></div>
+      <span class="ht">${took ? took + " · " : ""}${j.finished ? ago(j.finished) : ""}</span>
+      <button class="btn sm ghost" onclick="showLog('${j.id}')">Log</button></li>`;
+  }).join("");
+}
+
+/* ── actions ───────────────────────────────────────────── */
+async function queue(paths, dry) {
+  try {
+    const r = await api("/api/jobs", { paths, dry_run: !!dry });
+    toast(r.added ? `${dry ? "Preview" : "Encode"} queued for ${plural(r.added, "title")}` : "Already queued");
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+function queueWhere(fn) {
+  const paths = S.titles.filter(t => fn(t) && !jobFor(t.path)).map(t => t.path);
+  if (!paths.length) return;
+  if (paths.length > 1 && !confirm(`Queue ${plural(paths.length, "title")} for encoding? Originals are replaced once each title finishes cleanly.`)) return;
+  queue(paths);
+}
+async function cancelJob(id, running) {
+  if (running && !confirm("Stop this encode? The episode in progress is thrown away. Anything already replaced stays replaced, and finished encodes are reused next time.")) return;
+  try { await api(`/api/jobs/${id}/cancel`, {}); toast(running ? "Stopping…" : "Removed from queue"); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+async function jobAction(id, act) {
+  try { await api(`/api/jobs/${id}/${act}`, {}); toast(act === "pause" ? "Paused" : "Resumed"); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+async function moveJob(id, dir) { try { await api(`/api/jobs/${id}/${dir}`, {}); refresh(); } catch (e) { toast(e.message, true); } }
+async function showLog(id) {
+  const h = S.jobs.history.find(j => j.id === id);
+  $("#logTitle").textContent = h ? `${h.name}${h.dry_run ? " (preview)" : ""}` : "Log";
+  $("#logDlg").showModal();
+  paintLog($("#logFull"), ["Loading…"]);
+  try { const r = await api(`/api/jobs/${id}/log`); paintLog($("#logFull"), r.lines); $("#logFull").scrollTop = 1e9; }
+  catch (e) { paintLog($("#logFull"), ["Log not available: " + e.message]); }
+}
+
+$("#libBody").addEventListener("click", e => {
+  const b = e.target.closest("[data-act]"); if (!b) return;
+  const path = b.closest("tr").dataset.path;
+  if (b.dataset.act === "expand") { expanded.has(path) ? expanded.delete(path) : expanded.add(path); libKey = ""; renderLibrary(); }
+  if (b.dataset.act === "encode") queue([path]);
+  if (b.dataset.act === "preview") queue([path], true);
+});
+$("#libTabs").addEventListener("click", e => { const b = e.target.closest("[data-lib]"); if (b) { ui.lib = b.dataset.lib; save("ui", ui); libKey = ""; renderLibrary(); } });
+$("#statusTabs").addEventListener("click", e => { const b = e.target.closest("[data-status]"); if (b) { ui.status = b.dataset.status; save("ui", ui); libKey = ""; renderLibrary(); } });
+$("#search").addEventListener("input", () => { libKey = ""; renderLibrary(); });
+$("#sort").addEventListener("change", e => { ui.sort = e.target.value; save("ui", ui); libKey = ""; renderLibrary(); });
+$("#queueVisibleBtn").addEventListener("click", () => { const set = new Set(visibleTitles().map(t => t.path)); queueWhere(t => set.has(t.path) && t.above > 0); });
+$("#rescanBtn").addEventListener("click", async () => { detailCache.clear(); await api("/api/scan", {}).catch(e => toast(e.message, true)); toast("Rescanning library"); refresh(); schedule(); });
+
+/* ── settings ──────────────────────────────────────────── */
+const QHINT = { vaapi: "QP: 20 ≈ near-lossless, 32 = good & small.", nvenc: "CQ: try 24–28. Lower = bigger, better.", software: "CRF: try 24–28. Lower = bigger, better." };
+function openSettings() {
+  const c = S.config, f = $("#settingsForm");
+  f.libraries.value = c.libraries.join("\n");
+  const th = f.target_height;
+  if (![...th.options].some(o => +o.value === c.target_height)) th.add(new Option(c.target_height + "p", c.target_height));
+  th.value = c.target_height;
+  f.encoder.value = c.encoder; f.quality.value = c.quality;
+  f.vaapi_device.value = c.vaapi_device; f.temp_dir.value = c.temp_dir; f.log_dir.value = c.log_dir;
+  f.hw_decode.value = c.hw_decode; f.encode_hours.value = c.encode_hours;
+  $("#hoursHint").textContent = `Outside these hours encodes pause and pick up later. Server time is ${S.schedule.server_time}.`;
+  $("#cfgPath").textContent = c.config_path;
+  clearErrors(); syncEncoder();
+  $("#settingsDlg").showModal();
+}
+function syncEncoder() {
+  const f = $("#settingsForm");
+  $("#qualityHint").textContent = QHINT[f.encoder.value] || "";
+  $('[data-f="vaapi_device"]').style.opacity = f.encoder.value === "vaapi" ? 1 : .45;
+  $('[data-f="hw_decode"]').style.opacity = f.encoder.value === "software" ? .45 : 1;
+}
+function clearErrors() { document.querySelectorAll("#settingsForm .field").forEach(x => { x.classList.remove("bad"); x.querySelector(".error")?.remove(); }); }
+$("#settingsForm").encoder.addEventListener("change", syncEncoder);
+$("#settingsBtn").addEventListener("click", openSettings);
+$("#saveSettings").addEventListener("click", async e => {
+  e.preventDefault();
+  const f = $("#settingsForm");
+  clearErrors();
+  const body = {
+    libraries: f.libraries.value.split("\n").map(s => s.trim()).filter(Boolean),
+    target_height: +f.target_height.value, quality: f.quality.value === "" ? null : +f.quality.value,
+    encoder: f.encoder.value, vaapi_device: f.vaapi_device.value.trim(),
+    temp_dir: f.temp_dir.value.trim(), log_dir: f.log_dir.value.trim(),
+    hw_decode: f.hw_decode.value, encode_hours: f.encode_hours.value.trim(),
+  };
+  try {
+    await api("/api/settings", body);
+    $("#settingsDlg").close(); toast("Settings saved"); detailCache.clear(); libKey = ""; refresh();
+  } catch (err) {
+    const errs = err.data && err.data.errors;
+    if (!errs) return toast(err.message, true);
+    for (const [k, msg] of Object.entries(errs)) {
+      const fld = $(`[data-f="${k}"]`); if (!fld) continue;
+      fld.classList.add("bad");
+      const d = document.createElement("div"); d.className = "error"; d.textContent = msg; fld.append(d);
+    }
+  }
+});
+
+refresh().then(schedule);
+setInterval(() => pollLog(), 1000);
+</script>
+</body>
+</html>

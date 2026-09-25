@@ -1,6 +1,11 @@
 # reencode.conf - copy this to reencode.conf (or just run the script, it auto-generates one)
-# Path to your TV library (parent dir of your show folders)
-TV_DIR="/mnt/plex_media/TV"
+
+# Media libraries to process. Each is a folder of show or movie folders,
+# e.g. TV/<Show>/Season 1/*.mkv or Movies/<Movie (Year)>/*.mkv
+LIBRARIES=(
+  "/mnt/plex_media/TV"
+  "/mnt/plex_media/Movies"
+)
 
 # Where per-episode logs go
 LOG_DIR="/home/you/reencode_logs"
@@ -11,8 +16,18 @@ TEMP_DIR="/tmp/reencode"
 # Downscale target: only files taller than this get re-encoded
 TARGET_HEIGHT=720
 
-# VAAPI quality, lower = better (20 ~ near-lossless, 32 = good/small)
+# Quality, lower = better. Used as -qp (vaapi), -cq (nvenc) or -crf (software).
+# vaapi: 20 ~ near-lossless, 32 = good/small. software/nvenc: try 24-28.
 QUALITY=32
 
-# Hardware encode device (auto-detected if left empty)
+# Encoder: vaapi (Intel/AMD GPU), nvenc (NVIDIA GPU) or software (libx265, CPU, slow)
+ENCODER="vaapi"
+
+# VAAPI device (auto-detected if left empty; ignored by other encoders)
 VAAPI_DEVICE=""
+
+# Decode on the GPU too (vaapi/nvenc): auto = try GPU, fall back to CPU per file; no = CPU only
+HW_DECODE="auto"
+
+# Dashboard only: hours it may encode, e.g. "01:00-08:00". Empty = any time.
+ENCODE_HOURS=""
