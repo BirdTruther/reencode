@@ -8,6 +8,9 @@ reencode.sh, one title at a time.
     ./dashboard.py                      # http://<this machine>:8686
     ./dashboard.py --port 9000 --host 127.0.0.1
     REENCODE_DASHBOARD_PASSWORD=secret ./dashboard.py
+
+When listening beyond this machine, a password is required: one is generated
+on first run, printed, and saved as .dashboard_password next to reencode.conf.
 """
 
 import argparse
@@ -17,7 +20,9 @@ import hmac
 import json
 import os
 import re
+import secrets
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -32,11 +37,16 @@ ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "reencode.sh"
 COMMON = ROOT / "common.sh"
 INDEX_HTML = ROOT / "web" / "index.html"
-PROBE_CACHE = ROOT / ".dashboard_cache.json"
-HISTORY_FILE = ROOT / ".dashboard_history.json"
+# State lives next to reencode.conf (set in App.__init__), so a Docker /config
+# volume keeps it.
+PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = None
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 ENCODERS = ("vaapi", "nvenc", "software")
+HW_DECODE_MODES = ("auto", "no")
+HOURS_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+AUTH_MAX_FAILS = 10       # wrong passwords per IP ...
+AUTH_WINDOW = 10 * 60     # ... within this many seconds before we stop answering
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Characters that would break out of a double-quoted value in reencode.conf.
 UNSAFE_PATH = re.compile(r'["$`\\\x00-\x1f]')
@@ -55,7 +65,7 @@ def load_config():
     script = (
         'source "$1"; load_config >/dev/null 2>&1; '
         'printf "%s\\0" "$CONFIG_PATH" "$LOG_DIR" "$TEMP_DIR" "$TARGET_HEIGHT" '
-        '"$QUALITY" "$ENCODER" "$VAAPI_DEVICE"; '
+        '"$QUALITY" "$ENCODER" "$VAAPI_DEVICE" "$HW_DECODE" "$ENCODE_HOURS"; '
         'printf "%s\\0" "${LIBRARIES[@]}"'
     )
     out = subprocess.run(
@@ -63,9 +73,14 @@ def load_config():
         capture_output=True, check=True, stdin=subprocess.DEVNULL,
     ).stdout.decode("utf-8", "replace")
     parts = out.split("\0")[:-1]
-    keys = ["config_path", "log_dir", "temp_dir", "target_height", "quality", "encoder", "vaapi_device"]
-    cfg = dict(zip(keys, parts[:7]))
-    cfg["libraries"] = [p for p in parts[7:] if p]
+    keys = ["config_path", "log_dir", "temp_dir", "target_height", "quality", "encoder",
+            "vaapi_device", "hw_decode", "encode_hours"]
+    cfg = dict(zip(keys, parts[:len(keys)]))
+    cfg["libraries"] = [p for p in parts[len(keys):] if p]
+    if cfg.get("hw_decode") not in HW_DECODE_MODES:
+        cfg["hw_decode"] = "auto"
+    if not HOURS_RE.match(cfg.get("encode_hours", "")):
+        cfg["encode_hours"] = ""
     for k in ("target_height", "quality"):
         try:
             cfg[k] = int(cfg[k])
@@ -134,6 +149,19 @@ def validate_settings(data):
     if enc not in ENCODERS:
         errors["encoder"] = "Pick one of: " + ", ".join(ENCODERS)
     clean["encoder"] = enc
+
+    hw = data.get("hw_decode", "auto")
+    if hw not in HW_DECODE_MODES:
+        errors["hw_decode"] = "Pick one of: " + ", ".join(HW_DECODE_MODES)
+    clean["hw_decode"] = hw
+
+    hours = data.get("encode_hours") or ""
+    if not isinstance(hours, str):
+        hours = ""
+    hours = hours.replace(" ", "").replace("–", "-")
+    if hours and not HOURS_RE.match(hours):
+        errors["encode_hours"] = "Use HH:MM-HH:MM (24h), e.g. 01:00-08:00, or leave empty"
+    clean["encode_hours"] = hours
     return clean, errors
 
 
@@ -142,18 +170,39 @@ def save_config(s):
         'source "$1"; load_config >/dev/null 2>&1; shift; '
         'LIBRARIES=("$@"); LOG_DIR=$R_LOG_DIR; TEMP_DIR=$R_TEMP_DIR; '
         'TARGET_HEIGHT=$R_TARGET_HEIGHT; QUALITY=$R_QUALITY; ENCODER=$R_ENCODER; '
-        'VAAPI_DEVICE=$R_VAAPI_DEVICE; write_config'
+        'VAAPI_DEVICE=$R_VAAPI_DEVICE; HW_DECODE=$R_HW_DECODE; ENCODE_HOURS=$R_ENCODE_HOURS; '
+        'write_config'
     )
     env = dict(os.environ)
     env.update({
         "R_LOG_DIR": s["log_dir"], "R_TEMP_DIR": s["temp_dir"],
         "R_TARGET_HEIGHT": str(s["target_height"]), "R_QUALITY": str(s["quality"]),
         "R_ENCODER": s["encoder"], "R_VAAPI_DEVICE": s["vaapi_device"],
+        "R_HW_DECODE": s["hw_decode"], "R_ENCODE_HOURS": s["encode_hours"],
     })
     subprocess.run(
         ["bash", "-c", script, "_", str(COMMON), *s["libraries"]],
         env=env, check=True, capture_output=True, stdin=subprocess.DEVNULL,
     )
+
+
+def parse_hours(spec):
+    m = HOURS_RE.match(spec or "")
+    if not m:
+        return None
+    h1, m1, h2, m2 = map(int, m.groups())
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def in_window(spec, t=None):
+    """True if encoding is allowed now. Windows may wrap midnight (22:00-06:00)."""
+    w = parse_hours(spec)
+    if not w or w[0] == w[1]:
+        return True
+    lt = time.localtime(t)
+    cur = lt.tm_hour * 60 + lt.tm_min
+    start, end = w
+    return start <= cur < end if start < end else (cur >= start or cur < end)
 
 
 # ── Library scanning ───────────────────────────────────────────────────────
@@ -391,6 +440,9 @@ class Job:
         self.encoded = 0
         self.failures = []
         self.returncode = None
+        self.paused = False
+        self.paused_by = None        # "user" or "schedule"
+        self.schedule_override = False
 
     def add_line(self, line):
         self.seq += 1
@@ -423,9 +475,8 @@ class Job:
         if self.duration and self.status == "running":
             pct = max(0.0, min(1.0, self.out_time / self.duration))
         eta = None
-        if pct and self.file_started and pct > 0.01:
-            elapsed = now() - self.file_started
-            eta = elapsed / pct - elapsed
+        if pct is not None and self.speed and self.duration:
+            eta = max(0.0, self.duration - self.out_time) / self.speed
         return {
             "id": self.id, "path": self.path, "name": self.name, "library": self.library,
             "dry_run": self.dry_run, "status": self.status, "created": self.created,
@@ -435,6 +486,7 @@ class Job:
             "saved_mb": self.orig_mb - self.new_mb, "orig_mb": self.orig_mb,
             "new_mb": self.new_mb, "encoded": self.encoded, "failures": self.failures[-20:],
             "returncode": self.returncode, "log_seq": self.seq,
+            "paused": self.paused, "paused_by": self.paused_by,
         }
 
     def history_record(self):
@@ -452,11 +504,13 @@ class JobRunner:
         self.queue = []
         self.current = None
         self.waiting_external = False
+        self.waiting_schedule = False
         try:
             self.history = json.loads(HISTORY_FILE.read_text())
         except (OSError, ValueError):
             self.history = []
         threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._scheduler, daemon=True).start()
 
     def enqueue(self, title, dry_run=False):
         with self.lock:
@@ -479,12 +533,50 @@ class JobRunner:
             j = self.current
             if j and j.id == job_id and j.proc:
                 j.cancel_requested = True
-                try:
-                    os.killpg(j.proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                stop_job(j)
                 return True
         return False
+
+    def pause(self, job_id, by="user"):
+        with self.lock:
+            j = self.current
+            if not j or j.id != job_id or not j.proc or j.paused:
+                return False
+            try:
+                os.killpg(j.proc.pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                return False
+            j.paused, j.paused_by = True, by
+            j.add_line(f"-- paused ({'encoding hours' if by == 'schedule' else 'by you'}) --")
+            return True
+
+    def resume(self, job_id, by="user"):
+        with self.lock:
+            j = self.current
+            if not j or j.id != job_id or not j.proc or not j.paused:
+                return False
+            if by == "user" and not in_window(self.app.config["encode_hours"]):
+                j.schedule_override = True  # you asked for it; don't re-pause this job
+            try:
+                os.killpg(j.proc.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                return False
+            j.paused, j.paused_by = False, None
+            j.add_line("-- resumed --")
+            return True
+
+    def _scheduler(self):
+        """Pause the running job outside ENCODE_HOURS and resume it inside."""
+        while True:
+            time.sleep(20)
+            j = self.current
+            if not j or not j.proc:
+                continue
+            ok = in_window(self.app.config["encode_hours"])
+            if not ok and not j.paused and not j.schedule_override:
+                self.pause(j.id, by="schedule")
+            elif ok and j.paused and j.paused_by == "schedule":
+                self.resume(j.id, by="schedule")
 
     def move(self, job_id, delta):
         with self.lock:
@@ -544,6 +636,11 @@ class JobRunner:
                     time.sleep(5)
                     continue
                 self.waiting_external = False
+                if not in_window(self.app.config["encode_hours"]):
+                    self.waiting_schedule = True
+                    time.sleep(20)
+                    continue
+                self.waiting_schedule = False
                 with self.lock:
                     if not self.queue:
                         break
@@ -629,11 +726,22 @@ class JobRunner:
                 "queue": [j.public() for j in self.queue],
                 "history": [{k: v for k, v in h.items() if k != "log_tail"} for h in self.history[:50]],
                 "waiting_external": self.waiting_external,
+                "waiting_schedule": self.waiting_schedule and bool(self.queue),
             }
 
     def saved_total_mb(self):
         with self.lock:
             return sum(h.get("saved_mb", 0) for h in self.history if not h.get("dry_run"))
+
+
+def stop_job(job):
+    """SIGTERM the job's process group; a paused (SIGSTOPped) job must be
+    continued too or it would never see the signal."""
+    try:
+        os.killpg(job.proc.pid, signal.SIGTERM)
+        os.killpg(job.proc.pid, signal.SIGCONT)
+    except ProcessLookupError:
+        pass
 
 
 def external_encodes():
@@ -667,10 +775,20 @@ _APP = None
 
 # ── App / HTTP ─────────────────────────────────────────────────────────────
 
+def set_state_dir(d):
+    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    PROBE_CACHE = d / ".dashboard_cache.json"
+    HISTORY_FILE = d / ".dashboard_history.json"
+    PASSWORD_FILE = d / ".dashboard_password"
+
+
 class App:
-    def __init__(self, password):
-        self.password = password
+    def __init__(self):
+        self.password = ""
         self.config = load_config()
+        set_state_dir(Path(self.config["config_path"]).parent)
         self.library = Library(self)
         self.jobs = JobRunner(self)
 
@@ -702,6 +820,8 @@ class App:
             },
             "jobs": self.jobs.state(),
             "external": external_encodes(),
+            "schedule": {"hours": cfg["encode_hours"], "open": in_window(cfg["encode_hours"]),
+                         "server_time": time.strftime("%H:%M")},
             "time": now(),
         }
 
@@ -723,13 +843,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
+
+    fails = {}
+    fails_lock = threading.Lock()
 
     def _authed(self):
         pw = self.app.password
         if not pw:
             return True
+        ip = self.client_address[0]
+        with self.fails_lock:
+            recent = [t for t in self.fails.get(ip, []) if t > now() - AUTH_WINDOW]
+            self.fails[ip] = recent
+        if len(recent) >= AUTH_MAX_FAILS:
+            self._send(429, {"error": "Too many wrong passwords. Try again in a few minutes."})
+            return False
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
             try:
@@ -738,6 +872,9 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             except ValueError:
                 pass
+            with self.fails_lock:
+                self.fails.setdefault(ip, []).append(now())
+            time.sleep(0.5)
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="reencode"')
         self.send_header("Content-Length", "0")
@@ -819,6 +956,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
             ok = app.jobs.cancel(parts[2])
             return self._send(200 if ok else 404, {"ok": ok})
+        if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] in ("pause", "resume"):
+            fn = app.jobs.pause if parts[3] == "pause" else app.jobs.resume
+            ok = fn(parts[2])
+            return self._send(200 if ok else 409, {"ok": ok})
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] in ("up", "down"):
             ok = app.jobs.move(parts[2], -1 if parts[3] == "up" else 1)
             return self._send(200 if ok else 404, {"ok": ok})
@@ -834,34 +975,91 @@ class Handler(BaseHTTPRequestHandler):
                 app.reload_config()
             except subprocess.CalledProcessError as e:
                 return self._send(500, {"error": e.stderr.decode("utf-8", "replace")})
+            app.jobs.wake.set()
             app.library.request_scan()
             return self._send(200, app.config)
         return self._send(404, {"error": "Not found"})
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Dropped connections and plain-HTTP requests to an HTTPS port are normal.
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def is_loopback(host):
+    return host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
+
+
+def resolve_password(args):
+    """Explicit password > saved file > generated (only when reachable from other machines)."""
+    if args.no_password:
+        return ""
+    if args.password:
+        return args.password
+    try:
+        pw = PASSWORD_FILE.read_text().strip()
+        if pw:
+            print(f"  Password: saved in {PASSWORD_FILE}")
+            return pw
+    except OSError:
+        pass
+    if is_loopback(args.host):
+        return ""
+    pw = secrets.token_urlsafe(12)
+    fd = os.open(PASSWORD_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pw + "\n")
+    print(f"  Generated a password: {pw}")
+    print(f"  (any username; saved in {PASSWORD_FILE}. Set REENCODE_DASHBOARD_PASSWORD to choose your own.)")
+    return pw
+
+
 def main():
     global _APP
+    sys.stdout.reconfigure(line_buffering=True)  # show up promptly in journald / docker logs
+    env = os.environ.get
     ap = argparse.ArgumentParser(description="Web dashboard for reencode.sh")
-    ap.add_argument("--host", default=os.environ.get("REENCODE_DASHBOARD_HOST", "0.0.0.0"),
-                    help="address to listen on (default 0.0.0.0 = whole LAN; 127.0.0.1 = this machine only)")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("REENCODE_DASHBOARD_PORT", 8686)))
-    ap.add_argument("--password", default=os.environ.get("REENCODE_DASHBOARD_PASSWORD", ""),
-                    help="require this password (any username) via HTTP basic auth")
+    ap.add_argument("--host", default=env("REENCODE_DASHBOARD_HOST", "0.0.0.0"),
+                    help="address to listen on (default 0.0.0.0 = whole network; 127.0.0.1 = this machine only)")
+    ap.add_argument("--port", type=int, default=int(env("REENCODE_DASHBOARD_PORT", 8686)))
+    ap.add_argument("--password", default=env("REENCODE_DASHBOARD_PASSWORD", ""),
+                    help="password to require (any username). Default: generated on first run")
+    ap.add_argument("--no-password", action="store_true",
+                    default=env("REENCODE_DASHBOARD_NO_PASSWORD", "") not in ("", "0", "false"),
+                    help="disable the password, e.g. behind a reverse proxy that does its own login")
+    ap.add_argument("--tls-cert", default=env("REENCODE_DASHBOARD_TLS_CERT", ""),
+                    help="serve HTTPS with this certificate (PEM)")
+    ap.add_argument("--tls-key", default=env("REENCODE_DASHBOARD_TLS_KEY", ""),
+                    help="private key for --tls-cert (PEM)")
     args = ap.parse_args()
 
-    _APP = App(args.password)
+    _APP = App()
     Handler.app = _APP
-    _APP.library.request_scan()
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
-    shown = "localhost" if args.host in ("0.0.0.0", "") else args.host
-    print(f"reencode dashboard on http://{shown}:{args.port}  (config: {_APP.config['config_path']})")
-    if args.host in ("0.0.0.0", "", "::") and not args.password:
-        print("  Listening on all interfaces with no password; set REENCODE_DASHBOARD_PASSWORD "
-              "or use --host 127.0.0.1 if this machine isn't on a trusted network.")
+    server = Server((args.host, args.port), Handler)
+    scheme = "http"
+    if args.tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.tls_cert, args.tls_key or None)
+        # Handshake lazily in the request thread so a slow client can't stall accept().
+        server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+        scheme = "https"
+
+    shown = "localhost" if args.host in ("0.0.0.0", "", "::") else args.host
+    print(f"reencode dashboard on {scheme}://{shown}:{args.port}  (config: {_APP.config['config_path']})")
+    _APP.password = resolve_password(args)
+    if not _APP.password and not is_loopback(args.host):
+        print("  WARNING: no password and reachable from other machines (--no-password).")
+    if scheme == "http" and _APP.password and not is_loopback(args.host):
+        print("  Tip: use --tls-cert/--tls-key or a reverse proxy for HTTPS if you reach this from outside your home network.")
     if not _APP.config["libraries"]:
         print("  No libraries configured yet - open the dashboard and use Settings.")
+    _APP.library.request_scan()
 
     def shutdown(*_):
         raise KeyboardInterrupt
@@ -877,10 +1075,10 @@ def main():
         if job and job.proc and job.proc.poll() is None:
             print("Stopping current encode...")
             job.cancel_requested = True
+            stop_job(job)
             try:
-                os.killpg(job.proc.pid, signal.SIGTERM)
                 job.proc.wait(timeout=30)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
                 pass
 
 

@@ -25,3 +25,9 @@ ENCODER="vaapi"
 
 # VAAPI device (auto-detected if left empty; ignored by other encoders)
 VAAPI_DEVICE=""
+
+# Decode on the GPU too (vaapi/nvenc): auto = try GPU, fall back to CPU per file; no = CPU only
+HW_DECODE="auto"
+
+# Dashboard only: hours it may encode, e.g. "01:00-08:00". Empty = any time.
+ENCODE_HOURS=""

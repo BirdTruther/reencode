@@ -9,12 +9,14 @@ CACHE_FILE="${SCRIPT_DIR}/.encodetv_cache"
 # Defaults (overridden by config file)
 LIBRARIES=()
 TV_DIR=""      # pre-LIBRARIES configs; still honoured
-LOG_DIR="${HOME}/reencode_logs"
-TEMP_DIR="/tmp/reencode"
+LOG_DIR="${REENCODE_LOG_DIR:-${HOME}/reencode_logs}"
+TEMP_DIR="${REENCODE_TEMP_DIR:-/tmp/reencode}"
 TARGET_HEIGHT=720
 QUALITY=32
 ENCODER="vaapi"
 VAAPI_DEVICE=""
+HW_DECODE="auto"
+ENCODE_HOURS=""
 
 VIDEO_FIND_EXPR=( \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.m4v" -o -iname "*.ts" \) )
 
@@ -35,6 +37,7 @@ detect_library() {
     local name d
     for name in "$@"; do
         for d in \
+            "/media/$name" "/data/$name" \
             "/mnt/plex_media/$name" "/mnt/media/$name" "/mnt/library/$name" \
             /media/*/"$name" /mnt/*/"$name" /data/*/"$name" /storage/*/"$name" \
             "$HOME/$name" "$HOME/Videos/$name" "$HOME/Plex/$name"; do
@@ -94,6 +97,12 @@ ENCODER="${ENCODER}"
 
 # VAAPI device (auto-detected if left empty; ignored by other encoders)
 VAAPI_DEVICE="${VAAPI_DEVICE}"
+
+# Decode on the GPU too (vaapi/nvenc): auto = try GPU, fall back to CPU per file; no = CPU only
+HW_DECODE="${HW_DECODE}"
+
+# Dashboard only: hours it may encode, e.g. "01:00-08:00". Empty = any time.
+ENCODE_HOURS="${ENCODE_HOURS}"
 EOF
 }
 

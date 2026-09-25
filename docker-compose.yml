@@ -1,0 +1,29 @@
+services:
+  reencode:
+    build: .
+    # Or use the prebuilt image instead of building (see README):
+    # image: ghcr.io/birdtruther/reencode:latest
+    container_name: reencode
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    devices:
+      - /dev/dri:/dev/dri              # Intel/AMD GPU (VAAPI)
+    environment:
+      - PUID=1000                      # user/group that owns your media: run `id` to check
+      - PGID=1000
+      - TZ=Etc/UTC                     # your timezone, used for encoding hours (e.g. America/New_York)
+      # - REENCODE_DASHBOARD_PASSWORD=pick-one   # otherwise one is generated: docker logs reencode
+    volumes:
+      - ./config:/config               # settings, history, logs, generated password
+      - /path/to/scratch:/transcode    # temporary encodes (an SSD is ideal)
+      - /path/to/TV:/media/TV          # your libraries; add as many as you like under /media
+      - /path/to/Movies:/media/Movies
+    # NVIDIA instead of /dev/dri (needs nvidia-container-toolkit), and set ENCODER to nvenc:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu, video]

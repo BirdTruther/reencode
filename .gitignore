@@ -2,6 +2,7 @@ reencode.conf
 .encodetv_cache
 *.log
 *.bak
-.dashboard_cache.*
-.dashboard_history.*
+.dashboard_*
 __pycache__/
+# docker compose's settings/history/password volume
+config/

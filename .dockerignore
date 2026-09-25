@@ -1,0 +1,8 @@
+.git
+.github
+docs
+reencode.conf
+.encodetv_cache
+.dashboard_*
+__pycache__
+*.log

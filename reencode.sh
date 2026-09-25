@@ -121,17 +121,24 @@ get_file_size_mb() {
     echo $(( size_bytes / 1024 / 1024 ))
 }
 
-# Sets ENC_PRE (before -i), ENC_VF (filter chain) and ENC_V (video codec args).
+# Sets ENC_PRE (before -i), ENC_VF (filter chain) and ENC_V (video codec args)
+# for CPU decoding, and GPU_PRE/GPU_VF for decoding + scaling on the GPU too.
 setup_encoder() {
+    GPU_PRE=()
+    GPU_VF=""
     case "$ENCODER" in
         vaapi)
             ENC_PRE=(-vaapi_device "$VAAPI_DEVICE")
             ENC_VF="scale=-2:${TARGET_HEIGHT},format=nv12,hwupload"
+            GPU_PRE=(-hwaccel vaapi -hwaccel_device "$VAAPI_DEVICE" -hwaccel_output_format vaapi)
+            GPU_VF="scale_vaapi=w=-2:h=${TARGET_HEIGHT}:format=nv12"
             ENC_V=(-c:v hevc_vaapi -qp "$QUALITY")
             ENC_NAME=hevc_vaapi ;;
         nvenc)
             ENC_PRE=()
             ENC_VF="scale=-2:${TARGET_HEIGHT}"
+            GPU_PRE=(-hwaccel cuda -hwaccel_output_format cuda)
+            GPU_VF="scale_cuda=-2:${TARGET_HEIGHT}"
             ENC_V=(-c:v hevc_nvenc -preset p5 -rc vbr -cq "$QUALITY" -b:v 0)
             ENC_NAME=hevc_nvenc ;;
         software)
@@ -243,27 +250,45 @@ encode_file() {
     esac
 
     local -a progress_args=()
-    if [[ -n "${REENCODE_PROGRESS:-}" ]]; then
-        rm -f "$REENCODE_PROGRESS"
-        progress_args=(-progress "$REENCODE_PROGRESS")
-    fi
+    [[ -n "${REENCODE_PROGRESS:-}" ]] && progress_args=(-progress "$REENCODE_PROGRESS")
 
-    local start_time
+    # Try decoding on the GPU first; some sources (old codecs, odd profiles)
+    # can't be, so fall back to CPU decoding for just that file.
+    local -a modes=(cpu) pre=()
+    local mode vf ok=false start_time
+    [[ "$HW_DECODE" != "no" && -n "$GPU_VF" ]] && modes=(gpu cpu)
+
     start_time=$(date +%s)
-
-    rm -f "$part"
     CURRENT_PART="$part"
-    if ffmpeg -nostdin -hide_banner -loglevel warning -stats -y \
-        "${ENC_PRE[@]}" \
-        -i "$input" \
-        -map 0:v:0 -map '0:a?' -map '0:s?' -map '0:t?' \
-        -c copy \
-        -vf "$ENC_VF" \
-        "${ENC_V[@]}" \
-        "${sub_args[@]}" \
-        -max_muxing_queue_size 1024 \
-        "${progress_args[@]}" \
-        -f matroska "$part" 2>"$logfile"; then
+    : > "$logfile"
+    for mode in "${modes[@]}"; do
+        if [[ "$mode" == gpu ]]; then
+            pre=("${GPU_PRE[@]}"); vf="$GPU_VF"
+        else
+            pre=("${ENC_PRE[@]}"); vf="$ENC_VF"
+        fi
+        log "  Decode: ${mode^^}"
+        rm -f "$part"
+        [[ -n "${REENCODE_PROGRESS:-}" ]] && rm -f "$REENCODE_PROGRESS"
+        echo "=== ${mode} decode ===" >> "$logfile"
+        if ffmpeg -nostdin -hide_banner -loglevel warning -stats -y \
+            "${pre[@]}" \
+            -i "$input" \
+            -map 0:v:0 -map '0:a?' -map '0:s?' -map '0:t?' \
+            -c copy \
+            -vf "$vf" \
+            "${ENC_V[@]}" \
+            "${sub_args[@]}" \
+            -max_muxing_queue_size 1024 \
+            "${progress_args[@]}" \
+            -f matroska "$part" 2>>"$logfile"; then
+            ok=true
+            break
+        fi
+        [[ "$mode" == gpu ]] && log_warn "  GPU decode failed for this file, retrying with CPU decode"
+    done
+
+    if [[ "$ok" == true ]]; then
 
         if ! verify_output "$input" "$part"; then
             rm -f "$part"
@@ -283,7 +308,10 @@ encode_file() {
         return 0
     else
         log_err "FAILED: $filename (see $logfile)"
-        tail -n 3 "$logfile" 2>/dev/null | sed 's/\r/\n/g' | grep -v '^frame=' | tail -n 3 | while IFS= read -r l; do log_err "  $l"; done
+        # Show the most telling lines from the last attempt.
+        awk '/^=== .* decode ===$/ { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' "$logfile" 2>/dev/null \
+            | sed 's/\r/\n/g' | grep -iE 'cannot|error|invalid|not supported|unsupported|no such|failed|denied' \
+            | grep -v '^frame=' | head -n 3 | while IFS= read -r l; do log_err "  $l"; done
         rm -f "$part"
         CURRENT_PART=""
         return 1
@@ -558,7 +586,7 @@ main() {
     [[ "$DRY_RUN" == true ]] || check_encoder
 
     log "TV Re-encoder"
-    log "Target: >${TARGET_HEIGHT}p -> ${TARGET_HEIGHT}p HEVC ${ENC_NAME} (quality ${QUALITY})"
+    log "Target: >${TARGET_HEIGHT}p -> ${TARGET_HEIGHT}p HEVC ${ENC_NAME} (quality ${QUALITY}, GPU decode: ${HW_DECODE})"
     log "Libraries: ${LIBRARIES[*]}"
     log "Temp dir: $TEMP_DIR"
     log "Dry run: $DRY_RUN"
