@@ -887,8 +887,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
             return None
         origin = self.headers.get("Origin")
-        if origin and urlparse(origin).netloc != self.headers.get("Host"):
-            return None
+        if origin:
+            # Behind a reverse proxy (Cosmos, Caddy, nginx...) Host may be the
+            # container's address; the public one is in X-Forwarded-Host.
+            hosts = {self.headers.get("Host")}
+            hosts.update(h.strip() for h in self.headers.get("X-Forwarded-Host", "").split(","))
+            if urlparse(origin).netloc not in hosts:
+                return None
         n = int(self.headers.get("Content-Length") or 0)
         if n > 1_000_000:
             return None

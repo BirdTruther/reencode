@@ -66,6 +66,8 @@ The first run auto-generates `reencode.conf` (gitignored), detecting your TV/Mov
 2. **Use a reverse proxy with HTTPS.** For example, with [Caddy](https://caddyserver.com), `reencode.example.com { reverse_proxy localhost:8686 }` gets a certificate automatically.
 3. **Use the built-in HTTPS:** `--tls-cert fullchain.pem --tls-key privkey.pem`, or the `REENCODE_DASHBOARD_TLS_CERT`/`_KEY` environment variables.
 
+**With Cosmos** (or Nginx Proxy Manager, Traefik, etc.): add a URL/route pointing at the container's port 8686 and let the proxy handle HTTPS. Then you can remove the `ports:` mapping so the dashboard is only reachable through the proxy. Keep the dashboard's own password on, or, if you turn on the proxy's login for this route, you can set `REENCODE_DASHBOARD_NO_PASSWORD=1` to avoid logging in twice. Only do that when the port isn't also published.
+
 Without HTTPS, the password travels in plain text, which is fine on your own network but not over the internet.
 
 ## Web dashboard
