@@ -201,12 +201,22 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
 .dlg-f { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--border); }
 .field { display: grid; gap: 5px; align-content: start; }
 .field label { font-weight: 600; font-size: 13px; }
-.field .hint { color: var(--muted); font-size: 12.5px; }
+.field .hint, .dlg-b > .hint { color: var(--muted); font-size: 12.5px; }
 .field .error { color: var(--err); font-size: 12.5px; }
 .field input, .field select, .field textarea { height: 34px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); padding: 0 10px; outline: none; width: 100%; }
 .field textarea { height: auto; min-height: 76px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; resize: vertical; }
 .field.bad input, .field.bad textarea, .field.bad select { border-color: var(--err); }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.lib-rows { display: grid; gap: 8px; }
+.lib-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }
+.field .lib-row select { width: auto; }
+.profiles { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.profile { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px 14px; margin: 0; display: grid; gap: 12px; min-width: 0; }
+.profile legend { font-weight: 650; font-size: 13px; padding: 0 6px; }
+.title-set { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 16px 10px 46px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.title-set select { height: 30px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel); padding: 0 8px; }
+.why { font-size: 12px; }
+.why.encode { color: var(--warn); } .why.keep4k { color: var(--info); } .why.extra, .why.skip, .why.unknown { color: var(--muted); } .why.ok { color: var(--ok); }
 
 #toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 50; width: min(420px, calc(100vw - 32px)); }
 .toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.2); animation: tin .2s ease; }
@@ -228,7 +238,8 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
   .seg { min-width: 40px; }
   .prog .c { display: none; }
   .acts .btn:not(.primary) { display: none; }
-  .row2 { grid-template-columns: 1fr; }
+  .row2, .profiles { grid-template-columns: 1fr; }
+  .title-set { padding-left: 12px; }
   .hist li { grid-template-columns: auto 1fr auto; }
   .hist .ht { display: none; }
   table.lib .files td { padding-left: 12px; }
@@ -318,19 +329,14 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
     <div class="dlg-h"><h3>Settings</h3><button class="btn icon-btn ghost" value="cancel" aria-label="Close">✕</button></div>
     <div class="dlg-b">
       <div class="field" data-f="libraries">
-        <label for="f_libraries">Libraries</label>
-        <textarea id="f_libraries" name="libraries" rows="3" placeholder="/mnt/media/TV&#10;/mnt/media/Movies"></textarea>
-        <div class="hint">One folder per line. Each should contain show or movie folders, e.g. <span class="mono">TV/Show Name/…</span> or <span class="mono">Movies/Movie Name (2020)/…</span></div>
+        <label>Libraries</label>
+        <div class="lib-rows" id="libRows"></div>
+        <div><button type="button" class="btn sm" id="addLib">+ Add library</button></div>
+        <div class="hint">Each folder should contain show or movie folders, e.g. <span class="mono">TV/Show Name/…</span> or <span class="mono">Movies/Movie Name (2020)/…</span></div>
       </div>
+      <div class="profiles" id="profileFields"></div>
+      <div class="hint" id="qualityHint"></div>
       <div class="row2">
-        <div class="field" data-f="target_height">
-          <label for="f_target_height">Target resolution</label>
-          <select id="f_target_height" name="target_height">
-            <option value="480">480p</option><option value="540">540p</option><option value="576">576p</option>
-            <option value="720">720p</option><option value="1080">1080p</option><option value="1440">1440p</option>
-          </select>
-          <div class="hint">Anything taller gets downscaled to this.</div>
-        </div>
         <div class="field" data-f="encoder">
           <label for="f_encoder">Encoder</label>
           <select id="f_encoder" name="encoder">
@@ -338,13 +344,6 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
             <option value="nvenc">NVENC (NVIDIA GPU)</option>
             <option value="software">Software (CPU, slow)</option>
           </select>
-        </div>
-      </div>
-      <div class="row2">
-        <div class="field" data-f="quality">
-          <label for="f_quality">Quality</label>
-          <input id="f_quality" name="quality" type="number" min="0" max="51" step="1">
-          <div class="hint" id="qualityHint"></div>
         </div>
         <div class="field" data-f="vaapi_device">
           <label for="f_vaapi_device">VAAPI device</label>
@@ -483,7 +482,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) { re
 /* ── render ────────────────────────────────────────────── */
 function render() {
   const c = S.config, st = S.stats;
-  $("#cfgline").textContent = `→ ${c.target_height}p HEVC · ${c.encoder}` + (c.encode_hours ? ` · ${c.encode_hours}` : "");
+  $("#cfgline").textContent = `TV ${c.profiles.tv.height}p · Movies ${c.profiles.movies.height}p · ${c.encoder}` + (c.encode_hours ? ` · ${c.encode_hours}` : "");
 
   const sc = S.scan;
   $("#scanpill").innerHTML = sc.running
@@ -493,7 +492,7 @@ function render() {
   $("#stLib").textContent = bytes(st.library_bytes);
   $("#stLibS").textContent = `${plural(st.files, "file")} · ${plural(S.titles.length, "title")}`;
   $("#stTodo").textContent = st.to_encode_files.toLocaleString();
-  $("#stTodoS").textContent = `files over ${c.target_height}p · ${bytes(st.to_encode_bytes)}`;
+  $("#stTodoS").textContent = `files to shrink · ${bytes(st.to_encode_bytes)}`;
   $("#stEst").textContent = "~" + bytes(st.est_savings_bytes);
   $("#stEstS").textContent = `assuming ${Math.round((1 - st.size_ratio) * 100)}% smaller` + (st.size_ratio === 0.6 ? " (estimate)" : " (from your results)");
   $("#stSaved").textContent = mb(st.saved_mb);
@@ -524,7 +523,7 @@ function renderNow() {
     el.innerHTML = `<div class="idle">
       <div class="idle-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z" fill="currentColor"/></svg></div>
       <div style="flex:1;min-width:200px"><div class="idle-t">${S.jobs.waiting_schedule ? `Waiting for encoding hours (${esc(S.config.encode_hours)})` : "Nothing encoding" + (S.jobs.waiting_external ? " (waiting for the other encode)" : "")}</div>
-      <div class="muted">${todo ? `${plural(todo, "title")} have files above ${S.config.target_height}p.` : S.titles.length ? "Everything is at or below the target. Nice." : "Waiting for the library scan."}</div></div>
+      <div class="muted">${todo ? `${plural(todo, "title")} have files to shrink.` : S.titles.length ? "Everything is already the size you want. Nice." : "Waiting for the library scan."}</div></div>
       ${todo ? `<button class="btn primary" onclick="queueWhere(t => t.above > 0)">Encode everything that needs it</button>` : ""}
     </div>`;
     return;
@@ -672,11 +671,11 @@ function renderLibrary() {
   $("#sort").value = ui.sort;
 
   const v = visibleTitles();
-  const key = JSON.stringify([v.map(t => [t.path, t.above, t.at, t.files, t.size, t.status]), S.jobs.current?.path, S.jobs.current?.paused, S.jobs.queue.map(q => q.path), [...expanded], S.config.target_height, S.stats.size_ratio, libs.length]);
+  const key = JSON.stringify([v.map(t => [t.path, t.above, t.at, t.files, t.size, t.status]), S.jobs.current?.path, S.jobs.current?.paused, S.jobs.queue.map(q => q.path), [...expanded], S.config.profiles, S.stats.size_ratio, libs.length, v.map(t => t.override)]);
   const q = v.filter(t => t.above > 0 && !jobFor(t.path));
   $("#queueVisibleBtn").disabled = !q.length;
   $("#queueVisibleBtn").textContent = q.length ? `Encode all shown (${q.length})` : "Encode all shown";
-  $("#libFoot").innerHTML = `<span>${plural(v.length, "title")} shown</span><span>Green = at ${S.config.target_height}p · amber = still to encode</span>`;
+  $("#libFoot").innerHTML = `<span>${plural(v.length, "title")} shown</span><span>Green = done · amber = still to shrink</span>`;
   if (key === libKey) return;
   libKey = key;
 
@@ -693,12 +692,12 @@ function renderLibrary() {
     const j = jobFor(t.path), open = expanded.has(t.path);
     const dPct = t.files ? t.at / t.files * 100 : 0, tPct = t.files ? t.above / t.files * 100 : 0;
     const badge = j ? (j.state === "running" ? (j.job.paused ? `<span class="badge b-na">Paused</span>` : `<span class="badge b-run"><span class="dot live"></span>${j.job.dry_run ? "Previewing" : "Encoding"}</span>`) : `<span class="badge b-queued">Queued</span>`)
-      : { ready: `<span class="badge b-ready">To do</span>`, partial: `<span class="badge b-partial">Partial</span>`, done: `<span class="badge b-done">Done</span>`, "n/a": `<span class="badge b-na" title="All files are below the target resolution">Below target</span>` }[t.status];
+      : { ready: `<span class="badge b-ready">To do</span>`, partial: `<span class="badge b-partial">Partial</span>`, done: `<span class="badge b-done">Done</span>`, skipped: `<span class="badge b-na">Never shrink</span>`, "n/a": `<span class="badge b-na" title="The video in these files can't be read">Unreadable</span>` }[t.status];
     const acts = j ? "" : t.above > 0
       ? `<button class="btn sm" data-act="preview">Preview</button><button class="btn sm primary" data-act="encode">Encode</button>` : "";
     return `<tr class="row" data-path="${esc(t.path)}">
       <td><div class="tname"><button class="expander" data-act="expand" aria-expanded="${open}" aria-label="Show files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-        <span class="tname-t">${esc(t.name)}</span>${multi ? `<span class="libtag hide-sm">${esc(libName(t.library))}</span>` : ""}</div></td>
+        <span class="tname-t">${esc(t.name)}</span>${multi ? `<span class="libtag hide-sm">${esc(libName(t.library))}</span>` : ""}${t.override && t.override !== "skip" ? `<span class="libtag" title="Set for this title only" style="color:var(--accent)">${esc(t.override)}p</span>` : ""}</div></td>
       <td><div class="prog"><div class="seg"><i class="d" style="width:${dPct}%"></i><i class="t" style="width:${tPct}%"></i></div><span class="c">${t.at}/${t.files}</span></div></td>
       <td class="num hide-sm">${bytes(t.size)}</td>
       <td class="num hide-md">${t.above_size ? "~" + bytes(t.above_size * (1 - ratio)) : '<span class="faint">–</span>'}</td>
@@ -708,25 +707,50 @@ function renderLibrary() {
   }).join("");
 }
 
+// Fingerprint of a title's summary; a cached file list is refetched when it changes.
+const detailFp = t => t ? JSON.stringify([t.above, t.at, t.files, t.size, t.target, t.override, t.status]) : "";
+const ACTION = { encode: "to shrink", ok: "", keep4k: "kept", extra: "left as is", skip: "never shrink", unknown: "unreadable" };
+
 function detailHtml(path) {
   const d = detailCache.get(path);
-  if (!d) { loadDetail(path); return `<div class="empty" style="padding:14px">Loading…</div>`; }
-  const target = S.config.target_height;
-  return `<table class="files">${d.files.map(f => {
-    const cls = !f.height ? "lo" : f.height > target ? "hi" : f.height === target ? "ok" : "lo";
+  const t = S.titles.find(x => x.path === path);
+  if (!d || (d.fp && d.fp !== detailFp(t))) { loadDetail(path, t); if (!d) return `<div class="empty" style="padding:14px">Loading…</div>`; }
+  const st = d.settings || {};
+  const def = `Default (${PROFILE_LABEL[st.profile] || "TV"} · ${st.default_height}p)`;
+  const opts = [["", def], ...HEIGHTS.map(h => [String(h), h + "p"]), ["skip", "Never shrink"]]
+    .map(([v, n]) => `<option value="${v}" ${v === (st.override || "") ? "selected" : ""}>${n}</option>`).join("");
+  return `<div class="title-set"><label>Shrink to <select data-act="override" aria-label="Resolution for this title">${opts}</select></label>
+      <span class="muted">Only for this title. The ${PROFILE_LABEL[st.profile] || "TV"} profile is used otherwise.</span></div>
+    <table class="files">${d.files.map(f => {
+    const cls = !f.height ? "lo" : f.action === "encode" ? "hi" : f.action === "ok" && f.height === st.height ? "ok" : "lo";
     return `<tr><td class="mono" style="word-break:break-all">${esc(f.rel)}</td>
       <td class="res ${cls}">${f.height ? f.height + "p" : "?"}</td>
-      <td class="muted hide-sm">${esc(f.codec || "")}</td>
+      <td class="why ${esc(f.action)}" title="${esc(f.why)}">${esc(f.action === "ok" ? f.why : ACTION[f.action] ? ACTION[f.action] + (f.action === "encode" ? "" : ": " + f.why) : f.why)}</td>
       <td class="num muted hide-sm">${dur(f.duration)}</td>
       <td class="num">${bytes(f.size)}</td></tr>`;
   }).join("")}</table>`;
 }
 
-async function loadDetail(path) {
+const loading = new Set();
+async function loadDetail(path, t) {
+  if (loading.has(path)) return;
+  loading.add(path);
   try {
-    detailCache.set(path, await api("/api/title?path=" + encodeURIComponent(path)));
+    const d = await api("/api/title?path=" + encodeURIComponent(path));
+    d.fp = detailFp(t);
+    detailCache.set(path, d);
   } catch { detailCache.set(path, { files: [] }); }
+  loading.delete(path);
   libKey = ""; renderLibrary();
+}
+
+async function setOverride(path, value) {
+  try {
+    await api("/api/title/override", { path, value });
+    detailCache.delete(path);
+    toast(value === "skip" ? "This title won't be shrunk" : value ? `This title will be shrunk to ${value}p` : "Using the default profile again");
+    await refresh();
+  } catch (e) { toast(e.message, true); }
 }
 
 function renderHistory() {
@@ -783,6 +807,9 @@ async function showLog(id) {
   catch (e) { paintLog($("#logFull"), ["Log not available: " + e.message]); }
 }
 
+$("#libBody").addEventListener("change", e => {
+  if (e.target.dataset.act === "override") setOverride(e.target.closest("tr").previousElementSibling.dataset.path, e.target.value);
+});
 $("#libBody").addEventListener("click", e => {
   const b = e.target.closest("[data-act]"); if (!b) return;
   const path = b.closest("tr").dataset.path;
@@ -798,14 +825,46 @@ $("#queueVisibleBtn").addEventListener("click", () => { const set = new Set(visi
 $("#rescanBtn").addEventListener("click", async () => { detailCache.clear(); await api("/api/scan", {}).catch(e => toast(e.message, true)); toast("Rescanning library"); refresh(); schedule(); });
 
 /* ── settings ──────────────────────────────────────────── */
-const QHINT = { vaapi: "QP: 20 ≈ near-lossless, 32 = good & small.", nvenc: "CQ: try 24–28. Lower = bigger, better.", software: "CRF: try 24–28. Lower = bigger, better." };
+const QHINT = { vaapi: "Quality is QP: 20 ≈ near-lossless, 28–32 = good & small.", nvenc: "Quality is CQ: try 24–28. Lower = bigger, better.", software: "Quality is CRF: try 24–28. Lower = bigger, better." };
+const HEIGHTS = [480, 540, 576, 720, 1080, 1440];
+const KEEP4K = { "no": "Shrink them too", "if-other-version": "Keep if another version", "yes": "Always keep" };
+const PROFILE_LABEL = { tv: "TV", movies: "Movies" };
+const heightOpts = sel => HEIGHTS.concat(HEIGHTS.includes(sel) ? [] : [sel]).sort((a, b) => a - b)
+  .map(h => `<option value="${h}" ${h === sel ? "selected" : ""}>${h}p</option>`).join("");
+
+function libRow(path, prof) {
+  const row = document.createElement("div");
+  row.className = "lib-row";
+  row.innerHTML = `<input class="lib-path" placeholder="/media/Movies" value="${esc(path)}">
+    <select class="lib-prof" aria-label="Profile">${Object.entries(PROFILE_LABEL).map(([k, n]) => `<option value="${k}" ${k === prof ? "selected" : ""}>${n}</option>`).join("")}</select>
+    <button type="button" class="btn icon-btn ghost" aria-label="Remove library">✕</button>`;
+  row.querySelector("button").onclick = () => row.remove();
+  // Guess the profile from the folder name as you type a new one.
+  row.querySelector(".lib-path").addEventListener("change", e => {
+    if (!path) row.querySelector(".lib-prof").value = /movie|film/i.test(e.target.value.split("/").pop()) ? "movies" : "tv";
+  });
+  return row;
+}
+
 function openSettings() {
   const c = S.config, f = $("#settingsForm");
-  f.libraries.value = c.libraries.join("\n");
-  const th = f.target_height;
-  if (![...th.options].some(o => +o.value === c.target_height)) th.add(new Option(c.target_height + "p", c.target_height));
-  th.value = c.target_height;
-  f.encoder.value = c.encoder; f.quality.value = c.quality;
+  const rows = $("#libRows");
+  rows.innerHTML = "";
+  c.libraries.forEach((l, i) => rows.append(libRow(l, c.library_profiles[i])));
+  if (!c.libraries.length) rows.append(libRow("", "tv"));
+  $("#profileFields").innerHTML = ["tv", "movies"].map(p => {
+    const pr = c.profiles[p];
+    return `<fieldset class="profile"><legend>${p === "tv" ? "TV shows" : "Movies"}</legend>
+      <div class="field" data-f="${p}_height"><label for="f_${p}_height">Resolution</label>
+        <select id="f_${p}_height">${heightOpts(pr.height)}</select></div>
+      <div class="field" data-f="${p}_quality"><label for="f_${p}_quality">Quality</label>
+        <input id="f_${p}_quality" type="number" min="0" max="51" step="1" value="${pr.quality}"></div>
+      <div class="field" data-f="${p}_keep_4k"><label for="f_${p}_keep_4k">4K files</label>
+        <select id="f_${p}_keep_4k">${Object.entries(KEEP4K).map(([k, n]) => `<option value="${k}" ${k === pr.keep_4k ? "selected" : ""}>${n}</option>`).join("")}</select>
+        <div class="hint">"Another version" means the same video in another resolution, in the same folder.</div></div>
+    </fieldset>`;
+  }).join("");
+  f.encoder.value = c.encoder;
   f.vaapi_device.value = c.vaapi_device; f.temp_dir.value = c.temp_dir; f.log_dir.value = c.log_dir;
   f.hw_decode.value = c.hw_decode; f.encode_hours.value = c.encode_hours;
   $("#hoursHint").textContent = `Outside these hours encodes pause and pick up later. Server time is ${S.schedule.server_time}.`;
@@ -822,13 +881,19 @@ function syncEncoder() {
 function clearErrors() { document.querySelectorAll("#settingsForm .field").forEach(x => { x.classList.remove("bad"); x.querySelector(".error")?.remove(); }); }
 $("#settingsForm").encoder.addEventListener("change", syncEncoder);
 $("#settingsBtn").addEventListener("click", openSettings);
+$("#addLib").addEventListener("click", () => { const r = libRow("", "tv"); $("#libRows").append(r); r.querySelector("input").focus(); });
 $("#saveSettings").addEventListener("click", async e => {
   e.preventDefault();
   const f = $("#settingsForm");
   clearErrors();
+  const num = id => $(id).value === "" ? null : +$(id).value;
   const body = {
-    libraries: f.libraries.value.split("\n").map(s => s.trim()).filter(Boolean),
-    target_height: +f.target_height.value, quality: f.quality.value === "" ? null : +f.quality.value,
+    libraries: [...document.querySelectorAll("#libRows .lib-row")]
+      .map(r => ({ path: r.querySelector(".lib-path").value.trim(), profile: r.querySelector(".lib-prof").value }))
+      .filter(l => l.path),
+    profiles: Object.fromEntries(["tv", "movies"].map(p => [p, {
+      height: num(`#f_${p}_height`), quality: num(`#f_${p}_quality`), keep_4k: $(`#f_${p}_keep_4k`).value,
+    }])),
     encoder: f.encoder.value, vaapi_device: f.vaapi_device.value.trim(),
     temp_dir: f.temp_dir.value.trim(), log_dir: f.log_dir.value.trim(),
     hw_decode: f.hw_decode.value, encode_hours: f.encode_hours.value.trim(),

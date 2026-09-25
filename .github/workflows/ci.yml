@@ -18,6 +18,10 @@ jobs:
         run: shellcheck -x -e SC2034 common.sh reencode.sh encodetv install-service.sh docker-entrypoint.sh
       - name: python
         run: python3 -m py_compile dashboard.py
+      - name: install ffmpeg
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - name: tests
+        run: python3 tests/test_plan.py
 
   docker:
     needs: lint

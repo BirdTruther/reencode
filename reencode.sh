@@ -15,6 +15,7 @@ VERIFY_ONLY=false
 FORCE=false
 ALLOW_FAILURES=false
 SETUP=false
+PLAN_ONLY=false
 MAX_FILES=0
 
 # Partial output currently being written; removed if we're interrupted.
@@ -29,6 +30,7 @@ Options:
   --show "Name"       Process only the matching show/movie folder (exact name wins, else substring)
   --dir PATH          Process exactly this show/movie folder
   --dry-run           Preview without encoding
+  --plan              Print what would happen to each file (action, height, reason, path)
   --verify-only       Check re-encoded files in temp dir
   --force             Re-encode even if temp file exists
   --allow-failures    Replace the episodes that succeeded even if others failed
@@ -46,6 +48,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run) DRY_RUN=true; shift ;;
+            --plan) PLAN_ONLY=true; DRY_RUN=true; shift ;;
             --all) ALL=true; shift ;;
             --show|--dir|--max)
                 if [[ $# -lt 2 ]]; then
@@ -78,17 +81,22 @@ run_setup() {
     echo "────────────────────────────────────────────"
     echo "Libraries are folders of show/movie folders (e.g. /mnt/media/TV /mnt/media/Movies)."
     read -rp "Libraries, separated by ';' [${LIBRARIES[*]:-none detected}]: " ans
-    [[ -n "$ans" ]] && IFS=';' read -ra LIBRARIES <<< "$ans"
+    if [[ -n "$ans" ]]; then
+        IFS=';' read -ra LIBRARIES <<< "$ans"
+        LIBRARY_PROFILES=()   # re-guess TV/Movies from the folder names
+    fi
     read -rp "Log dir [${LOG_DIR}]: " ans
     [[ -n "$ans" ]] && LOG_DIR="$ans"
     read -rp "Temp dir [${TEMP_DIR}]: " ans
     [[ -n "$ans" ]] && TEMP_DIR="$ans"
-    read -rp "Target height [${TARGET_HEIGHT}]: " ans
-    [[ -n "$ans" ]] && TARGET_HEIGHT="$ans"
+    read -rp "TV resolution [${TV_HEIGHT}]: " ans
+    [[ -n "$ans" ]] && TV_HEIGHT="$ans"
+    read -rp "Movies resolution [${MOVIES_HEIGHT}]: " ans
+    [[ -n "$ans" ]] && MOVIES_HEIGHT="$ans"
     read -rp "Encoder: vaapi, nvenc or software [${ENCODER}]: " ans
     [[ -n "$ans" ]] && ENCODER="$ans"
-    read -rp "Quality [${QUALITY}]: " ans
-    [[ -n "$ans" ]] && QUALITY="$ans"
+    read -rp "Quality [${TV_QUALITY}]: " ans
+    [[ -n "$ans" ]] && TV_QUALITY="$ans" && MOVIES_QUALITY="$ans"
     if [[ "$ENCODER" == "vaapi" ]]; then
         read -rp "VAAPI device [${VAAPI_DEVICE:-auto}]: " ans
         [[ -n "$ans" ]] && VAAPI_DEVICE="$ans"
@@ -101,10 +109,6 @@ run_setup() {
 
 setup_dirs() {
     mkdir -p "$TEMP_DIR" "$LOG_DIR"
-}
-
-get_video_height() {
-    ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$1" 2>/dev/null | head -1
 }
 
 get_video_codec() {
@@ -210,9 +214,9 @@ encode_file() {
     logfile="${LOG_DIR}/${base}.log"
     original_size_mb=$(get_file_size_mb "$input")
 
-    height=$(get_video_height "$input")
-    if [[ -z "$height" || "$height" -le "$TARGET_HEIGHT" ]]; then
-        log_warn "SKIP (already <= ${TARGET_HEIGHT}p): $filename [${height:-?}p, ${original_size_mb}MB]"
+    height=${HEIGHTS["$input"]:-}
+    if [[ "${PLAN["$input"]:-}" != encode ]]; then
+        log_warn "SKIP (${WHY["$input"]:-nothing to do}): $filename [${height:-?}p, ${original_size_mb}MB]"
         return 2
     fi
 
@@ -403,34 +407,45 @@ video_exts() {
     find "$1" -type f "${VIDEO_FIND_EXPR[@]}" ! -name '.*' -print0 | sort -Vz
 }
 
-# Returns 0 if any file in the dir is taller than the target height
-show_has_work() {
-    local f h
+title_files() {
+    TITLE_FILES=()
+    local f
     while IFS= read -r -d '' f; do
-        h=$(get_video_height "$f")
-        if [[ -n "$h" && "$h" -gt "$TARGET_HEIGHT" ]]; then
-            return 0
-        fi
+        TITLE_FILES+=("$f")
     done < <(video_exts "$1")
-    return 1
 }
 
-# Returns 1 if any episode failed.
+print_plan() {
+    local f
+    for f in "${TITLE_FILES[@]}"; do
+        printf '%s\t%s\t%s\t%s\n' "${PLAN["$f"]}" "${HEIGHTS["$f"]:-?}" "${WHY["$f"]}" "$f"
+    done
+}
+
+# Returns 1 if any episode failed. Sets SHOW_TODO to the number of files to shrink.
 process_show() {
     local show_dir="$1"
-    local show_name
+    local show_name f
     show_name=$(basename "$show_dir")
+
+    title_files "$show_dir"
+    plan_title "${TITLE_FILES[@]}"
+    SHOW_TODO=0
+    for f in "${TITLE_FILES[@]}"; do
+        [[ "${PLAN["$f"]}" == encode ]] && SHOW_TODO=$((SHOW_TODO + 1))
+    done
+    if [[ "$SHOW_TODO" -eq 0 ]]; then
+        log "Nothing to shrink in: $show_name"
+        return 0
+    fi
 
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log "Processing: $show_name"
+    log "  Profile: ${PROFILE_NAME} -> ${TARGET_HEIGHT}p, quality ${QUALITY}, keep 4K: ${KEEP_4K}"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     local total_files=0 encoded_files=0 skipped_files=0 failed_files=0 total_saved=0
-
-    local -a file_list=()
-    while IFS= read -r -d '' f; do
-        file_list+=("$f")
-    done < <(video_exts "$show_dir")
+    local -a file_list=("${TITLE_FILES[@]}")
 
     local total_available=${#file_list[@]}
     log "Found $total_available video files"
@@ -487,13 +502,11 @@ process_replacement_phase() {
     log "Replacing originals: $show_name"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    local -a file_list=()
-    while IFS= read -r -d '' f; do
-        file_list+=("$f")
-    done < <(video_exts "$show_dir")
-
+    # Only files this run planned to shrink. Another version of the same video
+    # would map to the same temp file, and must never be replaced by it.
     local file failed=0
-    for file in "${file_list[@]}"; do
+    for file in "${TITLE_FILES[@]}"; do
+        [[ "${PLAN["$file"]}" == encode ]] || continue
         replace_original "$file" || failed=$((failed + 1))
     done
     [[ "$failed" -eq 0 ]]
@@ -501,9 +514,21 @@ process_replacement_phase() {
 
 # Encode a show, then swap in the new files if every episode succeeded.
 run_show() {
-    local dir="$1" ok=true
+    local dir="${1%/}" ok=true
+    apply_profile "$dir"
+    setup_encoder
+    if [[ "$PLAN_ONLY" == true ]]; then
+        title_files "$dir"
+        plan_title "${TITLE_FILES[@]}"
+        print_plan
+        return 0
+    fi
+    if [[ "$TITLE_SKIP" == true ]]; then
+        log "Skipping $(basename "$dir"): set to never shrink"
+        return 0
+    fi
     process_show "$dir" || ok=false
-    [[ "$MAX_FILES" -gt 0 ]] && return 0
+    [[ "$SHOW_TODO" -eq 0 || "$MAX_FILES" -gt 0 ]] && return 0
     if [[ "$ok" == true || "$ALLOW_FAILURES" == true ]]; then
         process_replacement_phase "$dir" || ok=false
     else
@@ -515,13 +540,8 @@ run_show() {
 }
 
 process_all() {
-    local dir base_name rc=0
+    local dir rc=0
     while IFS= read -r -d '' dir; do
-        base_name=$(basename "$dir")
-        if ! show_has_work "$dir"; then
-            log_warn "Nothing to do for: $base_name"
-            continue
-        fi
         run_show "$dir" || rc=1
     done < <(list_titles)
     return "$rc"
@@ -571,7 +591,7 @@ main() {
             count=$((count + 1))
             height=$(get_video_height "$f")
             size_mb=$(get_file_size_mb "$f")
-            if [[ -n "$height" && "$height" -eq "$TARGET_HEIGHT" ]]; then
+            if [[ -n "$height" && ( "$height" -eq "$TV_HEIGHT" || "$height" -eq "$MOVIES_HEIGHT" ) ]]; then
                 log_ok "$(basename "$f") [${height}p, ${size_mb}MB]"
                 valid=$((valid + 1))
             else
@@ -585,13 +605,15 @@ main() {
     setup_encoder
     [[ "$DRY_RUN" == true ]] || check_encoder
 
-    log "TV Re-encoder"
-    log "Target: >${TARGET_HEIGHT}p -> ${TARGET_HEIGHT}p HEVC ${ENC_NAME} (quality ${QUALITY}, GPU decode: ${HW_DECODE})"
+    [[ "$PLAN_ONLY" == true ]] || {
+    log "Re-encoder: HEVC ${ENC_NAME}, GPU decode: ${HW_DECODE}"
+    log "Profiles: TV -> ${TV_HEIGHT}p (quality ${TV_QUALITY}, keep 4K: ${TV_KEEP_4K}), Movies -> ${MOVIES_HEIGHT}p (quality ${MOVIES_QUALITY}, keep 4K: ${MOVIES_KEEP_4K})"
     log "Libraries: ${LIBRARIES[*]}"
     log "Temp dir: $TEMP_DIR"
     log "Dry run: $DRY_RUN"
     [[ "$MAX_FILES" -gt 0 ]] && log "Max files: $MAX_FILES"
     log ""
+    }
 
     if [[ -n "$SHOW_DIR" ]]; then
         if [[ ! -d "$SHOW_DIR" ]]; then
