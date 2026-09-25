@@ -10,7 +10,7 @@ A 1080p or 4K file often comes out **less than half the size** and still looks g
 
 - **Web dashboard**: see your whole library, what's left to shrink, and how much space you'll save
 - **One click** to encode a show or movie, or everything at once, with a queue you can reorder
-- **Live progress**: speed, time left, and a live log
+- **Live progress**: speed, time left for the episode, the show and the whole queue, and a live log
 - **Pause, resume or stop** at any time
 - **Encoding hours** (e.g. overnight only), so it stays out of the way while you're watching
 - **TV shows, movies, home videos**: any folder of videos
