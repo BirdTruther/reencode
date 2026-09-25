@@ -722,9 +722,9 @@ function detailHtml(path) {
   return `<div class="title-set"><label>Shrink to <select data-act="override" aria-label="Resolution for this title">${opts}</select></label>
       <span class="muted">Only for this title. The ${PROFILE_LABEL[st.profile] || "TV"} profile is used otherwise.</span></div>
     <table class="files">${d.files.map(f => {
-    const cls = !f.height ? "lo" : f.action === "encode" ? "hi" : f.action === "ok" && f.height === st.height ? "ok" : "lo";
+    const cls = !f.height ? "lo" : f.action === "encode" ? "hi" : f.action === "ok" && f.cls === st.height ? "ok" : "lo";
     return `<tr><td class="mono" style="word-break:break-all">${esc(f.rel)}</td>
-      <td class="res ${cls}">${f.height ? f.height + "p" : "?"}</td>
+      <td class="res ${cls}" title="${f.width && f.height ? f.width + "×" + f.height : ""}">${f.height ? esc(f.res || f.height + "p") : "?"}<span class="faint hide-sm" style="font-weight:400"> ${f.width && f.height ? f.width + "×" + f.height : ""}</span></td>
       <td class="why ${esc(f.action)}" title="${esc(f.why)}">${esc(f.action === "ok" ? f.why : ACTION[f.action] ? ACTION[f.action] + (f.action === "encode" ? "" : ": " + f.why) : f.why)}</td>
       <td class="num muted hide-sm">${dur(f.duration)}</td>
       <td class="num">${bytes(f.size)}</td></tr>`;

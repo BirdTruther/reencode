@@ -238,52 +238,111 @@ group_key() {
 }
 
 get_video_height() {
-    ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$1" 2>/dev/null | head -1
+    probe_video "$1" && echo "$V_H"
+}
+
+# Find a file's main video stream: the largest one that isn't cover art. (The
+# first video stream can be cover art, or the 1080p layer of a Dolby Vision
+# dual-layer file.) Sets V_INDEX (stream index), V_W/V_H (stored size),
+# V_DW (display width, for non-square pixels) and V_CLASS (resolution class:
+# the 16:9-equivalent height, so 3840x1600 is 2160 = 4K, like Plex shows it).
+# Keep in sync with ffprobe()/res_class() in dashboard.py.
+probe_video() {
+    V_INDEX=""; V_W=""; V_H=""; V_DW=""; V_CLASS=""
+    local idx w h sar pic best=0 num den
+    while IFS=, read -r idx w h sar pic; do
+        [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ && "$w" -gt 0 && "$h" -gt 0 ]] || continue
+        [[ "$pic" == 1 ]] && continue
+        if [ $((w * h)) -gt "$best" ]; then
+            best=$((w * h)); V_INDEX=$idx; V_W=$w; V_H=$h
+            V_DW=$w
+            num=${sar%%:*}; den=${sar##*:}
+            if [[ "$sar" == *:* && "$num" =~ ^[0-9]+$ && "$den" =~ ^[0-9]+$ && "$num" -gt 0 && "$den" -gt 0 ]]; then
+                V_DW=$(( (w * num + den / 2) / den ))
+            fi
+        fi
+    done < <(ffprobe -v error -select_streams v \
+        -show_entries stream=index,width,height,sample_aspect_ratio:stream_disposition=attached_pic \
+        -of csv=p=0 "$1" 2>/dev/null)
+    [[ -n "$V_INDEX" ]] || return 1
+    V_CLASS=$(( (V_DW * 9 + 8) / 16 ))
+    [ "$V_H" -gt "$V_CLASS" ] && V_CLASS=$V_H
+    return 0
+}
+
+# Output size for shrinking a W x H video (display width DW) to resolution class T:
+# fit inside a 16:9 T box (720 -> 1280x720), keep the aspect ratio, even numbers.
+# Prints "OW OH".
+target_dims() {
+    awk -v w="$1" -v h="$2" -v dw="$3" -v t="$4" 'BEGIN {
+        bw = int(t * 16 / 9 + 0.5); f = bw / dw
+        if (t / h < f) f = t / h
+        if (f > 1) f = 1
+        printf "%d %d\n", int(w * f / 2 + 0.5) * 2, int(h * f / 2 + 0.5) * 2
+    }'
+}
+
+# Human label for a resolution class, e.g. 2160 -> 4K.
+res_label() {
+    if [ "$1" -ge 1800 ]; then echo 4K
+    elif [ "$1" -ge 1300 ]; then echo 1440p
+    elif [ "$1" -ge 900 ]; then echo 1080p
+    elif [ "$1" -ge 650 ]; then echo 720p
+    else echo "${1}p"
+    fi
 }
 
 # Decide what to do with each file of a title (after apply_profile). Sets
 #   PLAN[file]    encode | ok | keep4k | extra | skip | unknown
 #   WHY[file]     a short human-readable reason
-#   HEIGHTS[file] video height
+#   HEIGHTS[file] stored video height, CLASSES[file] resolution class (see probe_video)
+#   STREAMS[file] index of the main video stream, DWIDTHS[file] display width
 # Keep the rules in sync with plan_files() in dashboard.py.
-declare -gA PLAN=() WHY=() HEIGHTS=()
+declare -gA PLAN=() WHY=() HEIGHTS=() CLASSES=() STREAMS=() WIDTHS=() DWIDTHS=()
 plan_title() {
-    local f h key c
+    local f h cls key c
     local -A key_of=() versions=() small=() best_of=() best_h=()
-    PLAN=(); WHY=(); HEIGHTS=()
+    PLAN=(); WHY=(); HEIGHTS=(); CLASSES=(); STREAMS=(); WIDTHS=(); DWIDTHS=()
     for f in "$@"; do
-        h=$(get_video_height "$f")
-        [[ "$h" =~ ^[0-9]+$ ]] || h=""
+        if probe_video "$f"; then
+            h=$V_H
+            CLASSES["$f"]=$V_CLASS; STREAMS["$f"]=$V_INDEX; WIDTHS["$f"]=$V_W; DWIDTHS["$f"]=$V_DW
+        else
+            h=""
+        fi
         HEIGHTS["$f"]=$h
         key=$(group_key "$(basename "${f%.*}")")
         key_of["$f"]=$key
         c=${versions["$key"]:-0}
         versions["$key"]=$((c + 1))
+        # Stored height, not class: files this app already shrank by height
+        # (e.g. 1728x720) count as done and are never shrunk again.
         if [[ -n "$h" ]] && [ "$h" -le "$TARGET_HEIGHT" ]; then
-            small["$key"]=$h
+            small["$key"]=$(res_label "${CLASSES["$f"]}")
         fi
     done
     for f in "$@"; do
         h=${HEIGHTS["$f"]}
+        cls=${CLASSES["$f"]:-0}
         key=${key_of["$f"]}
         c=${versions["$key"]}
         if [[ -z "$h" ]]; then
             PLAN["$f"]=unknown; WHY["$f"]="can't read the video"
         elif [ "$h" -le "$TARGET_HEIGHT" ]; then
-            PLAN["$f"]=ok; WHY["$f"]="already ${h}p"
+            PLAN["$f"]=ok; WHY["$f"]="already $(res_label "$cls")"
         elif [[ "$TITLE_SKIP" == true ]]; then
             PLAN["$f"]=skip; WHY["$f"]="set to never shrink"
-        elif [ "$h" -ge 2160 ] && [[ "$KEEP_4K" == yes ]]; then
+        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == yes ]]; then
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K"
-        elif [ "$h" -ge 2160 ] && [[ "$KEEP_4K" == if-other-version ]] && [ "$c" -gt 1 ]; then
+        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == if-other-version ]] && [ "$c" -gt 1 ]; then
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K, another version exists"
         elif [[ -n "${small["$key"]:-}" ]]; then
-            PLAN["$f"]=extra; WHY["$f"]="a ${small["$key"]}p version already exists"
+            PLAN["$f"]=extra; WHY["$f"]="a ${small["$key"]} version already exists"
         else
             PLAN["$f"]=encode; WHY["$f"]="shrink to ${TARGET_HEIGHT}p"
-            if [[ -z "${best_of["$key"]:-}" ]] || [ "$h" -gt "${best_h["$key"]}" ]; then
+            if [[ -z "${best_of["$key"]:-}" ]] || [ "$cls" -gt "${best_h["$key"]}" ]; then
                 best_of["$key"]=$f
-                best_h["$key"]=$h
+                best_h["$key"]=$cls
             fi
         fi
     done

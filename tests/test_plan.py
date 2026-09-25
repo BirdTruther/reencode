@@ -17,8 +17,20 @@ sys.path.insert(0, str(ROOT))
 os.environ.pop("REENCODE_CONFIG", None)
 import dashboard  # noqa: E402
 
-# (library, title, file, height) -> expected action
+# (library, title, file, size, expected action). size is a height (16:9), "WxH",
+# "dual:WxH+WxH" (two video streams, first listed first) or "cover:WxH" (cover
+# art stored as the first video stream).
 CASES = [
+    # Widescreen 4K is 4K by width, like Plex shows it (was seen as 1600p).
+    ("Movies", "Scope (2019)", "Scope (2019) - 2160p.mkv", "3840x1600", "keep4k"),
+    ("Movies", "Scope (2019)", "Scope (2019) - 1080p.mkv", "1920x800", "encode"),
+    ("Movies", "Flat (2018)", "Flat (2018) 2160p.mkv", "3840x2076", "encode"),
+    # The 4K picture is the second video stream (like a Dolby Vision dual layer).
+    ("Movies", "Dual (2020)", "Dual (2020) 2160p.mkv", "dual:1920x1080+3840x2160", "keep4k"),
+    ("Movies", "Dual (2020)", "Dual (2020) 1080p.mkv", 1080, "encode"),
+    ("Movies", "Cover (2016)", "Cover (2016) 2160p.mp4", "cover:3840x2160", "encode"),
+    # Shrunk by an older version (by height only): done, never shrunk again.
+    ("Movies", "Legacy (2015)", "Legacy (2015) 720p.mkv", "1728x720", "ok"),
     ("Movies", "Film A (2020)", "Film A (2020) - 2160p.mkv", 2160, "keep4k"),
     ("Movies", "Film A (2020)", "Film A (2020) - 1080p.mkv", 1080, "encode"),
     ("Movies", "Film B (2021)", "Film B (2021) 2160p.mkv", 2160, "encode"),      # override 1080
@@ -39,11 +51,28 @@ NAMES = ["Film (2020) - 2160p", "Film (2020) 720p", "Show.S01E01.1080p.WEB", "Sh
          "Ü2160p Émile", "Café.1080p.x265"]
 
 
-def make_video(path, height):
+def run_ffmpeg(*args):
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", *args], check=True)
+
+
+def make_video(path, size, duration=0.2):
     path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
-                    "-i", f"color=size={height * 16 // 9 // 2 * 2}x{height}:duration=0.2",
-                    "-c:v", "libx264", "-preset", "ultrafast", str(path)], check=True)
+    src = lambda s: ["-f", "lavfi", "-i", f"color=size={s}:duration={duration}"]  # noqa: E731
+    if isinstance(size, int):
+        size = f"{size * 16 // 9 // 2 * 2}x{size}"
+    if size.startswith("dual:"):
+        a, b = size[5:].split("+")
+        run_ffmpeg(*src(a), *src(b), "-map", "0", "-map", "1", "-c:v", "libx264",
+                   "-preset", "ultrafast", str(path))
+    elif size.startswith("cover:"):
+        cover = path.with_suffix(".jpg")
+        run_ffmpeg("-f", "lavfi", "-i", "color=size=600x900", "-frames:v", "1", str(cover))
+        run_ffmpeg("-i", str(cover), *src(size[6:]), "-map", "0", "-map", "1",
+                   "-c:v:0", "mjpeg", "-c:v:1", "libx264", "-preset", "ultrafast",
+                   "-disposition:v:0", "attached_pic", str(path))
+        cover.unlink()
+    else:
+        run_ffmpeg(*src(size), "-c:v", "libx264", "-preset", "ultrafast", str(path))
 
 
 class PlanTest(unittest.TestCase):
@@ -84,8 +113,10 @@ ENCODER="software"
 
     def python_plan(self, lib, title_dir):
         files = []
-        for p in sorted(title_dir.rglob("*.mkv")):
-            files.append({"name": p.name, "path": str(p), "height": dashboard.ffprobe(str(p))["height"]})
+        for p in sorted(title_dir.rglob("*")):
+            if p.suffix in (".mkv", ".mp4"):
+                info = dashboard.ffprobe(str(p))
+                files.append({"name": p.name, "path": str(p), "height": info["height"], "cls": info["cls"]})
         ts = dashboard.title_settings(self.cfg, self.overrides, str(self.base / lib), str(title_dir))
         plan = dashboard.plan_files(files, ts["height"], ts["keep_4k"], ts["skip"])
         return {f["path"]: a for f, (a, _) in zip(files, plan)}
@@ -101,6 +132,49 @@ ENCODER="software"
             with self.subTest(file=name):
                 got = self.bash_plan(self.base / lib / title)[str(self.base / lib / title / name)]
                 self.assertEqual(got, expected)
+
+    def test_resolution_class(self):
+        for name, cls in [("Scope (2019) - 2160p.mkv", 2160), ("Scope (2019) - 1080p.mkv", 1080),
+                          ("Flat (2018) 2160p.mkv", 2160), ("Dual (2020) 2160p.mkv", 2160),
+                          ("Cover (2016) 2160p.mp4", 2160)]:
+            with self.subTest(file=name):
+                path = next(self.base.rglob(name))
+                self.assertEqual(dashboard.ffprobe(str(path))["cls"], cls)
+                self.assertEqual(dashboard.res_label(cls), "4K" if cls == 2160 else "1080p")
+
+    def test_output_size_keeps_aspect_ratio(self):
+        cases = {(3840, 1600, 720): "1280 534", (1920, 800, 1080): "1920 800",
+                 (3840, 2076, 720): "1280 692", (1920, 1080, 720): "1280 720",
+                 (1440, 1080, 720): "960 720", (1920, 1080, 480): "854 480"}
+        for (w, h, t), want in cases.items():
+            with self.subTest(size=f"{w}x{h}", target=t):
+                got = subprocess.run(["bash", "-c", 'source "$1"; target_dims "$2" "$3" "$2" "$4"', "_",
+                                      str(ROOT / "common.sh"), str(w), str(h), str(t)],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+                self.assertEqual(got, want)
+
+    def test_encode_widescreen(self):
+        """A real encode of a 2.40:1 4K file: right stream, 1280x534, original replaced."""
+        base = self.base / "enc"
+        src = base / "TV" / "Wide Show" / "Wide Show S01E01 2160p.mkv"
+        make_video(src, "dual:1920x1080+3840x1600", duration=1)
+        conf = base / "reencode.conf"
+        conf.write_text(f"""LIBRARIES=("{base}/TV")
+LIBRARY_PROFILES=("tv")
+LOG_DIR="{base}/logs"
+TEMP_DIR="{base}/tmp"
+TV_HEIGHT=720
+TV_QUALITY=30
+TV_KEEP_4K="no"
+ENCODER="software"
+""")
+        env = dict(os.environ, REENCODE_CONFIG=str(conf))
+        subprocess.run(["bash", str(ROOT / "reencode.sh"), "--dir", str(src.parent)],
+                       env=env, capture_output=True, check=True)
+        out = src.parent / "Wide Show S01E01 720p.mkv"
+        self.assertFalse(src.exists())
+        info = dashboard.ffprobe(str(out))
+        self.assertEqual((info["width"], info["height"], info["codec"]), (1280, 534, "hevc"))
 
     def test_group_key_matches(self):
         for name in NAMES:
