@@ -1,142 +1,156 @@
 # Reencode
 
-Downscales your TV shows and movies to 720p HEVC using hardware encoding to save disk space. Comes with a web dashboard, so you can queue, pause and watch encodes from any browser.
+Shrink your video library by re-encoding it to 720p HEVC on your GPU, and manage it all from a web dashboard.
 
-Originals are only replaced after every episode of a title encodes **and** verifies (right resolution, full length). An interrupted encode never touches your library.
+A 1080p or 4K file often comes out **less than half the size** and still looks great on most screens. Your originals are only replaced once the new file has been checked, so nothing is lost if something goes wrong.
 
 ![Dashboard](docs/dashboard.png)
 
-## Install
+## Features
 
-Pick one. All three give you the dashboard on port **8686**, and none needs a separate web server.
+- **Web dashboard**: see your whole library, what's left to shrink, and how much space you'll save
+- **One click** to encode a show or movie, or everything at once, with a queue you can reorder
+- **Live progress**: speed, time left, and a live log
+- **Pause, resume or stop** at any time
+- **Encoding hours** (e.g. overnight only), so it stays out of the way while you're watching
+- **TV shows, movies, home videos**: any folder of videos
+- **Safe by design**: every file is checked before it replaces the original
+- **Hardware encoding**: AMD, Intel and NVIDIA GPUs, or plain CPU
 
-### Docker (easiest)
+## Quick start (Docker)
 
-The image is published as `ghcr.io/birdtruther/reencode:latest` (amd64 + arm64), so you don't need to clone or build anything. Copy [`docker-compose.yml`](docker-compose.yml), edit the paths (your TV/Movies folders, a scratch folder, `PUID`/`PGID` = the owner of your media, your timezone), then:
+1. Save [`docker-compose.yml`](docker-compose.yml) and change the paths to your folders.
+2. Start it:
 
-```bash
-docker compose up -d
-docker logs reencode        # shows the generated password
+   ```bash
+   docker compose up -d
+   ```
+
+3. Get the generated password:
+
+   ```bash
+   docker logs reencode
+   ```
+
+4. Open `http://<your-server>:8686` and sign in (any username).
+
+### Using Cosmos, Portainer, Unraid or similar
+
+Paste the compose file into their "import compose" or stack screen, or create the container by hand:
+
+| Setting  | Value |
+|----------|-------|
+| Image    | `ghcr.io/birdtruther/reencode:latest` |
+| Port     | `8686` |
+| Device   | `/dev/dri` (AMD/Intel GPU) |
+| `PUID` / `PGID` | The user/group that owns your videos (run `id` to find them) |
+| `TZ`     | Your timezone, e.g. `America/New_York` |
+| `/config`    | Settings, history and logs (keep this) |
+| `/transcode` | Scratch space for encodes (an SSD is ideal) |
+| `/media/...` | Your libraries, e.g. `/media/TV` and `/media/Movies` |
+
+If your tool has a reverse proxy (Cosmos does), point a URL at port 8686 and let it handle HTTPS.
+
+## Organizing your library
+
+Point Reencode at one or more **library folders**. Each show or movie should be in its own folder inside:
+
+```
+/media/TV/Backyard Birds/Season 1/Backyard Birds S01E01 1080p.mkv
+/media/Movies/Family Reunion (2019)/Family Reunion (2019) 2160p.mp4
 ```
 
-**Cosmos, Portainer, Unraid, etc.:** paste the compose file into their compose/stack import, or create a container by hand with:
+This is the same layout Plex and Jellyfin use. Videos sitting loose in the library folder itself are skipped.
 
-| Setting | Value |
-|---|---|
-| Image | `ghcr.io/birdtruther/reencode:latest` |
-| Port | `8686` |
-| Device | `/dev/dri` (Intel/AMD GPU) |
-| Env | `PUID`, `PGID` (owner of your media, see `id`), `TZ` (e.g. `America/New_York`) |
-| Volumes | `/config` (settings, keep it), `/transcode` (scratch space), your libraries under `/media/...` (e.g. `/media/TV`, `/media/Movies`) |
+## Settings
 
-The image includes ffmpeg and the AMD and Intel GPU drivers. It runs as `PUID`/`PGID` so replaced files keep the right owner, and it joins the GPU's group automatically. Settings, history and logs live in `./config`.
+Change these in the dashboard under **Settings**, or edit `reencode.conf` (created on first run).
 
-To build the image yourself instead, clone the repo and swap the `image:` line in the compose file for `build: .`.
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| Libraries | auto-detected | Folders that contain your show/movie folders |
+| Target resolution | `720` | Anything taller gets scaled down to this |
+| Encoder | `vaapi` | `vaapi` (AMD/Intel), `nvenc` (NVIDIA) or `software` (CPU, slow) |
+| Quality | `32` | Lower = better quality, bigger files. Try 28–32 for `vaapi`, 24–28 for the others |
+| GPU decoding | `auto` | Also decode on the GPU (faster). Falls back to the CPU for files the GPU can't read |
+| Encoding hours | any time | e.g. `01:00-08:00`. Outside these hours encodes pause and resume later |
+| Temp folder | `/tmp/reencode` (`/transcode` in Docker) | Where new files are written before they replace the originals |
 
-### As a service (no Docker)
+**Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer.
 
-Needs `ffmpeg` and `python3` (3.8+) on the machine. The dashboard uses only the Python standard library, so there's nothing to `pip install`.
+## Security
+
+- **A password is on by default.** One is generated on first run, printed in the logs, and saved as `.dashboard_password` in the config folder. To choose your own, set `REENCODE_DASHBOARD_PASSWORD`.
+- **Wrong guesses are blocked.** After 10 wrong passwords, that address is locked out for 10 minutes.
+- **Reaching it from outside your home:** don't just open port 8686 on your router. Use a VPN like [Tailscale](https://tailscale.com), or a reverse proxy with HTTPS (Cosmos, Caddy, Nginx Proxy Manager, …).
+- **Proxy with its own login:** if you've turned that on and removed the port mapping, you can set `REENCODE_DASHBOARD_NO_PASSWORD=1` to avoid logging in twice.
+
+## How your files are kept safe
+
+1. Each video is encoded to a temporary file first.
+2. The new file is checked: right resolution and the same length as the original.
+3. Only when **every** episode of a show has passed is anything replaced. The new file is copied into place before the original is deleted.
+4. If the new file isn't smaller, the original is kept.
+
+Stopping, pausing, a crash or a full disk never replaces a good file with a broken one. All audio tracks and subtitles are kept, and subtitle files next to the video are renamed to match.
+
+## Other ways to run it
+
+<details>
+<summary><b>As a system service (without Docker)</b></summary>
+
+Needs `ffmpeg` and `python3` (3.8+). There are no other dependencies.
 
 ```bash
 git clone https://github.com/BirdTruther/reencode
 cd reencode
-sudo ./install-service.sh          # runs as you, starts now and on every boot
+sudo ./install-service.sh      # starts now and on every boot, prints the address and password
 ```
 
-It prints the address and password when it's done. Use `--port 9000` or `--user plex` to change things, `--print` to see the systemd unit without installing, and `--uninstall` to remove it.
+Options: `--port 9000`, `--user someone`, `--uninstall`.
+</details>
 
-### Just run it
+<details>
+<summary><b>Run the dashboard by hand</b></summary>
 
 ```bash
-./dashboard.py                     # Ctrl+C to stop
+./dashboard.py                        # Ctrl+C to stop
+./dashboard.py --host 127.0.0.1       # only reachable from this machine (no password needed)
+./dashboard.py --tls-cert cert.pem --tls-key key.pem   # built-in HTTPS
 ```
+</details>
 
-The first run auto-generates `reencode.conf` (gitignored), detecting your TV/Movies folders and GPU. Change anything from the dashboard's **Settings**, by editing the file, or with `./reencode.sh --setup`.
-
-## Security
-
-- **A password is on by default.** When the dashboard is reachable from other machines, a random password is generated on first run, printed, and saved to `.dashboard_password` next to `reencode.conf` (readable only by its owner). The username can be anything. To choose your own, set `REENCODE_DASHBOARD_PASSWORD`.
-- After 10 wrong passwords, that IP is locked out for 10 minutes.
-- `--host 127.0.0.1` limits it to the machine itself, which needs no password.
-- `--no-password` turns the password off, e.g. if a reverse proxy in front already handles logins.
-
-**Reaching it from outside your home:** don't just port-forward 8686. In order of preference:
-
-1. **Use a VPN** such as [Tailscale](https://tailscale.com) or WireGuard. Nothing is exposed to the internet at all.
-2. **Use a reverse proxy with HTTPS.** For example, with [Caddy](https://caddyserver.com), `reencode.example.com { reverse_proxy localhost:8686 }` gets a certificate automatically.
-3. **Use the built-in HTTPS:** `--tls-cert fullchain.pem --tls-key privkey.pem`, or the `REENCODE_DASHBOARD_TLS_CERT`/`_KEY` environment variables.
-
-**With Cosmos** (or Nginx Proxy Manager, Traefik, etc.): add a URL/route pointing at the container's port 8686 and let the proxy handle HTTPS. Then you can remove the `ports:` mapping so the dashboard is only reachable through the proxy. Keep the dashboard's own password on, or, if you turn on the proxy's login for this route, you can set `REENCODE_DASHBOARD_NO_PASSWORD=1` to avoid logging in twice. Only do that when the port isn't also published.
-
-Without HTTPS, the password travels in plain text, which is fine on your own network but not over the internet.
-
-## Web dashboard
-
-- **Library view** of every show and movie: how many files are already at the target resolution, size, estimated savings and status. Click a title to see each file's resolution, codec and length.
-- **One-click Encode** or **Preview** (dry run) per title, or "Encode everything that needs it".
-- **Queue**: jobs run one at a time (one GPU), and you can reorder or remove them.
-- **Live progress**: per-episode percentage, fps, speed, time left, and a live log.
-- **Pause / Resume** any time, and **Stop** safely: the partial file is thrown away and originals are untouched.
-- **Encoding hours** (e.g. `01:00-08:00`): encodes pause outside the window and pick up automatically, so they stay out of the way while people are watching.
-- **History**: space saved per job, failures, and full logs.
-- **Settings** editor for libraries, resolution, encoder, quality, GPU decoding and hours.
-- Works on phones, and supports light and dark mode.
-- If an encode started from the terminal is already running, queued jobs wait for it instead of fighting over the GPU.
-
-## Libraries (TV, movies, anything)
-
-`LIBRARIES` in `reencode.conf` lists folders of *titles*, where each title is a folder:
-
-```
-/mnt/media/TV/Show Name/Season 1/Show.S01E01.1080p.mkv
-/mnt/media/Movies/Heat (1995)/Heat (1995) 2160p.mkv
-```
-
-That's the layout Plex, Jellyfin, Sonarr and Radarr use by default. Files sitting loose in the library root (not in a folder) are ignored.
-
-## Command line
-
-The dashboard is optional. Everything still works from the terminal:
+<details>
+<summary><b>Command line only</b></summary>
 
 ```bash
-./encodetv                            # pick a title from an interactive menu (cached scan, fast)
-./reencode.sh --all                   # process every title in every library
-./reencode.sh --show "South Park"     # one title (exact folder name wins, else substring)
-./reencode.sh --dir "/mnt/media/Movies/Heat (1995)"
-./reencode.sh --dry-run --show "X"    # preview, nothing gets encoded
-./reencode.sh --allow-failures --show "X"   # replace the episodes that worked even if some failed
+./encodetv                                 # pick a title from a menu
+./reencode.sh --all                        # everything in every library
+./reencode.sh --show "Backyard Birds"      # one show or movie
+./reencode.sh --dry-run --show "Backyard Birds"   # preview only, changes nothing
+./reencode.sh --help                       # all options
 ```
+</details>
 
-Optional: symlink `encodetv` into your PATH so you can run it from anywhere.
+<details>
+<summary><b>Build the Docker image yourself</b></summary>
 
-```bash
-ln -s "$PWD/encodetv" ~/bin/encodetv
-```
-
-## How it works
-
-- Only files taller than `TARGET_HEIGHT` (default 720) are touched. Files already at or below it are skipped.
-- With `vaapi`/`nvenc`, video is decoded, scaled and encoded entirely on the GPU, which is faster and leaves the CPU free. If the GPU can't decode a particular file (old or unusual codecs), that file is retried with CPU decoding automatically. Set `HW_DECODE="no"` to always decode on the CPU.
-- **All** audio tracks, subtitles and attachments are kept. MP4 text subtitles are converted to SRT so they fit in MKV.
-- Encodes are written to `TEMP_DIR` as `.part` files and only kept once they check out: correct height, and the same length as the source. Truncated or leftover files are thrown away and re-encoded.
-- Originals are swapped only after **all** of a title's episodes are done and verified. The new file is copied next to the original first, and the original is deleted only once the copy is in place, so a full disk can't lose an episode.
-- If an encode ends up *bigger* than the original, the original is kept and that file is skipped on future runs.
-- Output is always `.mkv`. Whatever resolution marker is in the filename gets replaced (`1080p`, `2160p`, `4K` → `720p`); if there's no marker, ` 720p` is appended. Matching subtitle/nfo sidecar files (`Show.S01E01.1080p.en.srt`) are renamed to match.
-
-## Encoders
-
-Set `ENCODER` in `reencode.conf` (or in dashboard Settings):
-
-| `ENCODER`  | Hardware                                   | `QUALITY` means | Good starting value |
-|------------|--------------------------------------------|-----------------|---------------------|
-| `vaapi`    | AMD Radeon (RX 400 and newer), Intel iGPU/Arc | `-qp`        | 28–32               |
-| `nvenc`    | NVIDIA GeForce/Quadro (GTX 950 and newer)  | `-cq`           | 24–28               |
-| `software` | Any CPU (libx265, slow)                    | `-crf`          | 24–28               |
-
-AMD cards up to the RX 500 series (Polaris) encode 8-bit HEVC only. Reencode always outputs 8-bit on VAAPI, so this just works.
+Clone the repo and replace the `image:` line in `docker-compose.yml` with `build: .`, then run `docker compose up -d --build`.
+</details>
 
 ## Troubleshooting
 
-- **Check your GPU can encode HEVC:** run `vainfo` (or `docker exec reencode vainfo`) and look for `VAProfileHEVCMain : VAEntrypointEncSlice`. If it's missing, install your distro's VA driver (`mesa-va-drivers` for AMD, `intel-media-va-driver` for Intel) or pick another encoder.
-- **"Permission denied" on `/dev/dri`:** the user running the dashboard needs to be in the `video` and `render` groups (`sudo usermod -aG video,render $USER`, then log out and back in). `install-service.sh` and the Docker image handle this for you.
-- **A file failed:** the dashboard's history shows the reason, and the full ffmpeg output is in `LOG_DIR/<file name>.log`.
+**Encodes fail straight away on a GPU.** Check that your GPU supports HEVC encoding: run `vainfo` (or `docker exec reencode vainfo`) and look for `VAProfileHEVCMain : VAEntrypointEncSlice`.
+- AMD needs `mesa-va-drivers`.
+- Intel needs `intel-media-va-driver`.
+- The Docker image already includes both.
+
+**"Permission denied" on `/dev/dri`.** Without Docker, add your user to the `video` and `render` groups (`sudo usermod -aG video,render $USER`), then log out and back in. With Docker, check that `/dev/dri` is passed to the container.
+
+**Something else failed.** Open **Recent jobs** in the dashboard and click **Log**. Full details for each file are in the `logs` folder.
+
+**NVIDIA with Docker.** Install the NVIDIA Container Toolkit, use the commented `deploy:` section in `docker-compose.yml` instead of `/dev/dri`, and set the encoder to `nvenc`.
+
+## License
+
+[GPL-3.0](LICENSE). You're free to use, change and share Reencode. If you distribute a modified version, share its source under the same license.
