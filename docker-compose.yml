@@ -4,21 +4,23 @@ services:
     # build: .                         # or build it yourself from this repo instead
     container_name: reencode
     restart: unless-stopped
+    stop_grace_period: 30s             # time to stop a running encode cleanly
     ports:
       - "8686:8686"
     devices:
-      - /dev/dri:/dev/dri              # Intel/AMD GPU (VAAPI)
+      - /dev/dri:/dev/dri              # Intel/AMD GPU (VAAPI). Remove if you have no Intel/AMD GPU
     environment:
       - PUID=1000                      # user/group that owns your media: run `id` to check
       - PGID=1000
       - TZ=Etc/UTC                     # your timezone, used for encoding hours (e.g. America/New_York)
       # - REENCODE_DASHBOARD_PASSWORD=pick-one   # otherwise one is generated: docker logs reencode
+    # Create these folders before the first start (mkdir -p ...); change the left-hand side only.
     volumes:
-      - ./config:/config               # settings, history, logs, generated password
+      - /path/to/config:/config        # settings, history, logs, generated password
       - /path/to/scratch:/transcode    # temporary encodes (an SSD is ideal)
       - /path/to/TV:/media/TV          # your libraries; add as many as you like under /media
       - /path/to/Movies:/media/Movies
-    # NVIDIA instead of /dev/dri (needs nvidia-container-toolkit), and set ENCODER to nvenc:
+    # NVIDIA instead of /dev/dri (needs nvidia-container-toolkit); then pick NVENC in Settings:
     # deploy:
     #   resources:
     #     reservations:

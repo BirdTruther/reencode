@@ -428,14 +428,14 @@ function ago(t) {
   return new Date(t * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? "" : "s"}`;
-// Rough, friendly durations for estimates: "about 3h 10m", "under a minute".
+// Rough, friendly durations for estimates: "~3h 10m", "under a minute".
 function approx(s) {
   if (s == null || !isFinite(s)) return null;
   if (s < 60) return "under a minute";
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m`;
+  if (m < 60) return `~${m}m`;
   const h = Math.floor(m / 60), r = m % 60;
-  return r && h < 10 ? `${h}h ${r}m` : `${h}h`;
+  return r && h < 10 ? `~${h}h ${r}m` : `~${h}h`;
 }
 // Clock time an estimate lands on, only when nothing will pause it.
 function finishAt(s) {
@@ -575,8 +575,8 @@ function renderNow() {
     ${fileBar}
     <div class="bar-row"><div class="bar thin"><i style="width:${(showPct * 100).toFixed(1)}%;background:var(--ok)"></i></div>
       <div class="bar-meta"><span>${j.episodes ? `${Math.max(0, j.episode - 1)} of ${plural(j.episodes, "file")} done` : ""}${replacing}${failed}</span>
-        <span>${titleLeft ? `<b>~${titleLeft}</b> left for ${j.episodes > 1 ? "this show" : "this title"}${finishAt(titleEta) ? ", done " + finishAt(titleEta) : ""}` : j.dry_run ? "" : "estimating time left…"}</span></div></div>
-    ${allLeft ? `<div class="eta-all"><span>Everything queued</span><span><b>~${allLeft}</b>${finishAt(eta.total_eta) ? ", done " + finishAt(eta.total_eta) : ""}${S.config.encode_hours ? ` of encoding time (runs ${esc(S.config.encode_hours)})` : ""}</span></div>` : ""}
+        <span>${titleLeft ? `<b>${titleLeft}</b> left for ${j.episodes > 1 ? "this show" : "this title"}${finishAt(titleEta) ? ", done " + finishAt(titleEta) : ""}` : j.dry_run ? "" : "estimating time left…"}</span></div></div>
+    ${allLeft ? `<div class="eta-all"><span>Everything queued</span><span><b>${allLeft}</b>${finishAt(eta.total_eta) ? ", done " + finishAt(eta.total_eta) : ""}${S.config.encode_hours ? ` of encoding time (runs ${esc(S.config.encode_hours)})` : ""}</span></div>` : ""}
     <div class="bar-meta" style="margin-top:-6px"><span></span><span>running ${dur(Date.now() / 1000 - j.started)}</span></div>
     <details class="logwrap" ${ui.logOpen ? "open" : ""}><summary>Live log</summary><div class="log" id="liveLog"></div></details>
   </div>`;
@@ -615,11 +615,11 @@ function renderQueue() {
   const q = S.jobs.queue;
   $("#queueCard").hidden = !q.length;
   const qEta = S.eta && approx(S.eta.queue_eta);
-  $("#queueCount").textContent = q.length ? plural(q.length, "title") + (qEta ? ` · ~${qEta}` : "") : "";
+  $("#queueCount").textContent = q.length ? plural(q.length, "title") + (qEta ? ` · ${qEta}` : "") : "";
   $("#queueList").innerHTML = q.map((j, i) => `<li>
     <span class="qnum">${i + 1}</span>
     <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}</span>
-    <span class="muted mono hide-sm">${S.eta && approx(S.eta.per_job[j.id]) ? "~" + approx(S.eta.per_job[j.id]) : ""}</span>
+    <span class="muted mono hide-sm">${(S.eta && approx(S.eta.per_job[j.id])) || ""}</span>
     <button class="btn sm ghost icon-btn" title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""} onclick="moveJob('${j.id}','up')">↑</button>
     <button class="btn sm ghost icon-btn" title="Move down" aria-label="Move down" ${i === q.length - 1 ? "disabled" : ""} onclick="moveJob('${j.id}','down')">↓</button>
     <button class="btn sm ghost" onclick="cancelJob('${j.id}')">Remove</button>

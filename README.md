@@ -21,20 +21,26 @@ A 1080p or 4K file shrunk to 720p (or a 4K file shrunk to 1080p) often comes out
 
 ## Quick start (Docker)
 
-1. Save [`docker-compose.yml`](docker-compose.yml) and change the paths to your folders.
-2. Start it:
+1. Save [`docker-compose.yml`](docker-compose.yml) and change the paths to your folders. Set `PUID`/`PGID` to the owner of your videos (run `id` to find the numbers).
+2. Create the config and scratch folders if they don't exist yet (some tools, like Cosmos, won't create them for you):
+
+   ```bash
+   mkdir -p /path/to/config /path/to/scratch
+   ```
+
+3. Start it:
 
    ```bash
    docker compose up -d
    ```
 
-3. Get the generated password:
+4. Get the generated password:
 
    ```bash
    docker logs reencode
    ```
 
-4. Open `http://<your-server>:8686` and sign in (any username).
+5. Open `http://<your-server>:8686` and sign in (any username).
 
 ### Using Cosmos, Portainer, Unraid or similar
 
@@ -47,11 +53,22 @@ Paste the compose file into their "import compose" or stack screen, or create th
 | Device   | `/dev/dri` (AMD/Intel GPU) |
 | `PUID` / `PGID` | The user/group that owns your videos (run `id` to find them) |
 | `TZ`     | Your timezone, e.g. `America/New_York` |
+| `REENCODE_DASHBOARD_PASSWORD` | Optional: your own password. Otherwise one is generated and shown in the logs |
 | `/config`    | Settings, history and logs (keep this) |
 | `/transcode` | Scratch space for encodes (an SSD is ideal) |
 | `/media/...` | Your libraries, e.g. `/media/TV` and `/media/Movies` |
 
 If your tool has a reverse proxy (Cosmos does), point a URL at port 8686 and let it handle HTTPS.
+
+### Updating
+
+Pull the new image and recreate the container, ideally while nothing is encoding. If something is, it's stopped safely: queue that title again afterwards, and the episodes that already finished are reused.
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+In Cosmos or Portainer, use their update or recreate button. Your settings, history and password live in `/config` and are kept.
 
 ## Organizing your library
 
@@ -78,6 +95,7 @@ Change these in the dashboard under **Settings**, or edit `reencode.conf` (creat
 | GPU decoding | `auto` | Also decode on the GPU (faster). Falls back to the CPU for files the GPU can't read |
 | Encoding hours | any time | e.g. `01:00-08:00`. Outside these hours encodes pause and resume later |
 | Temp folder | `/tmp/reencode` (`/transcode` in Docker) | Where new files are written before they replace the originals |
+| Log folder | `~/reencode_logs` (`/config/logs` in Docker) | Full encoder output for each file |
 
 ### Profiles and 4K
 
@@ -132,7 +150,7 @@ Options: `--port 9000`, `--user someone`, `--uninstall`.
 
 ```bash
 ./dashboard.py                        # Ctrl+C to stop
-./dashboard.py --host 127.0.0.1       # only reachable from this machine (no password needed)
+./dashboard.py --host 127.0.0.1       # only reachable from this machine (no password is generated)
 ./dashboard.py --tls-cert cert.pem --tls-key key.pem   # built-in HTTPS
 ```
 </details>
@@ -145,6 +163,7 @@ Options: `--port 9000`, `--user someone`, `--uninstall`.
 ./reencode.sh --all                        # everything in every library
 ./reencode.sh --show "Backyard Birds"      # one show or movie
 ./reencode.sh --dry-run --show "Backyard Birds"   # preview only, changes nothing
+./reencode.sh --plan --show "Backyard Birds"      # what would happen to each file, and why
 ./reencode.sh --help                       # all options
 ```
 </details>
@@ -157,6 +176,10 @@ Clone the repo and replace the `image:` line in `docker-compose.yml` with `build
 
 ## Troubleshooting
 
+**"bind source path does not exist" when creating the container.** One of the folders on the left side of a volume doesn't exist on your server. Create it (`mkdir -p /path/to/folder`) and deploy again.
+
+**The container won't start and mentions `/dev/dri`.** Your server has no Intel/AMD GPU device. Remove the `devices:` lines from the compose file and use the NVIDIA setup below, or the `software` encoder.
+
 **Encodes fail straight away on a GPU.** Check that your GPU supports HEVC encoding: run `vainfo` (or `docker exec reencode vainfo`) and look for `VAProfileHEVCMain : VAEntrypointEncSlice`.
 - AMD needs `mesa-va-drivers`.
 - Intel needs `intel-media-va-driver`.
@@ -166,7 +189,7 @@ Clone the repo and replace the `image:` line in `docker-compose.yml` with `build
 
 **Something else failed.** Open **Recent jobs** in the dashboard and click **Log**. Full details for each file are in the `logs` folder.
 
-**NVIDIA with Docker.** Install the NVIDIA Container Toolkit, use the commented `deploy:` section in `docker-compose.yml` instead of `/dev/dri`, and set the encoder to `nvenc`.
+**NVIDIA with Docker.** Install the NVIDIA Container Toolkit, use the commented `deploy:` section in `docker-compose.yml` instead of `/dev/dri`, and pick **NVENC** as the encoder in Settings.
 
 ## License
 
