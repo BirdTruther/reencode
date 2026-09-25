@@ -7,18 +7,31 @@ LIBRARIES=(
   "/mnt/plex_media/Movies"
 )
 
+# Profile for each library above, in the same order: tv or movies
+LIBRARY_PROFILES=(
+  "tv"
+  "movies"
+)
+
+# Profiles. HEIGHT: anything taller is shrunk to this. QUALITY: lower = better,
+# bigger (vaapi: 28-32, nvenc/software: 24-28). KEEP_4K: no = shrink 4K too,
+# if-other-version = leave 4K alone when the folder has another version of it,
+# yes = never touch 4K files.
+TV_HEIGHT=720
+TV_QUALITY=32
+TV_KEEP_4K="no"
+MOVIES_HEIGHT=1080
+MOVIES_QUALITY=32
+MOVIES_KEEP_4K="if-other-version"
+
+# Per-title exceptions live in title_overrides.tsv next to this file
+# (lines: "<height or skip><TAB><title folder>"); the dashboard edits it for you.
+
 # Where per-episode logs go
 LOG_DIR="/home/you/reencode_logs"
 
 # Scratch space for encoded files (use an SSD if you have one)
 TEMP_DIR="/tmp/reencode"
-
-# Downscale target: only files taller than this get re-encoded
-TARGET_HEIGHT=720
-
-# Quality, lower = better. Used as -qp (vaapi), -cq (nvenc) or -crf (software).
-# vaapi: 20 ~ near-lossless, 32 = good/small. software/nvenc: try 24-28.
-QUALITY=32
 
 # Encoder: vaapi (Intel/AMD GPU), nvenc (NVIDIA GPU) or software (libx265, CPU, slow)
 ENCODER="vaapi"

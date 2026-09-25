@@ -1,8 +1,8 @@
 # Reencode
 
-Shrink your video library by re-encoding it to 720p HEVC on your GPU, and manage it all from a web dashboard.
+Shrink your video library by re-encoding it to a smaller HEVC file on your GPU, and manage it all from a web dashboard.
 
-A 1080p or 4K file often comes out **less than half the size** and still looks great on most screens. Your originals are only replaced once the new file has been checked, so nothing is lost if something goes wrong.
+A 1080p or 4K file shrunk to 720p (or a 4K file shrunk to 1080p) often comes out **less than half the size** and still looks great on most screens. Your originals are only replaced once the new file has been checked, so nothing is lost if something goes wrong.
 
 ![Dashboard](docs/dashboard.png)
 
@@ -13,6 +13,8 @@ A 1080p or 4K file often comes out **less than half the size** and still looks g
 - **Live progress**: speed, time left for the episode, the show and the whole queue, and a live log
 - **Pause, resume or stop** at any time
 - **Encoding hours** (e.g. overnight only), so it stays out of the way while you're watching
+- **Profiles for TV and movies**: e.g. TV at 720p and movies at 1080p, with per-title exceptions
+- **Keeps your 4K copies** if you like, and handles folders with several versions of the same movie
 - **TV shows, movies, home videos**: any folder of videos
 - **Safe by design**: every file is checked before it replaces the original
 - **Hardware encoding**: AMD, Intel and NVIDIA GPUs, or plain CPU
@@ -68,13 +70,26 @@ Change these in the dashboard under **Settings**, or edit `reencode.conf` (creat
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
-| Libraries | auto-detected | Folders that contain your show/movie folders |
-| Target resolution | `720` | Anything taller gets scaled down to this |
+| Libraries | auto-detected | Folders that contain your show/movie folders, each marked **TV** or **Movies** |
+| TV / Movies resolution | `720` / `1080` | Anything taller gets scaled down to this |
+| TV / Movies quality | `32` | Lower = better quality, bigger files. Try 28–32 for `vaapi`, 24–28 for the others |
+| TV / Movies 4K files | shrink / keep if another version | See [Profiles and 4K](#profiles-and-4k) |
 | Encoder | `vaapi` | `vaapi` (AMD/Intel), `nvenc` (NVIDIA) or `software` (CPU, slow) |
-| Quality | `32` | Lower = better quality, bigger files. Try 28–32 for `vaapi`, 24–28 for the others |
 | GPU decoding | `auto` | Also decode on the GPU (faster). Falls back to the CPU for files the GPU can't read |
 | Encoding hours | any time | e.g. `01:00-08:00`. Outside these hours encodes pause and resume later |
 | Temp folder | `/tmp/reencode` (`/transcode` in Docker) | Where new files are written before they replace the originals |
+
+### Profiles and 4K
+
+Every library uses either the **TV** or the **Movies** profile, so shows and movies can be shrunk differently. To change a single show or movie, expand it in the dashboard and pick a resolution under **Shrink to**, or **Never shrink**.
+
+Each profile also decides what happens to **4K files**:
+
+- **Shrink them too**: 4K is shrunk like everything else.
+- **Keep if another version**: if a folder has the same movie in 4K and another resolution (e.g. `Movie (2020) - 2160p.mkv` and `Movie (2020) - 1080p.mkv`), the 4K is left alone and only the other copy is shrunk. A 4K file on its own is still shrunk.
+- **Always keep**: 4K files are never touched.
+
+When a folder has several versions of the same video, only one of them is ever shrunk, so they can't overwrite each other. If a small enough version already exists, the others are left as they are.
 
 **Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer.
 

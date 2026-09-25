@@ -44,6 +44,8 @@ PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = None
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 ENCODERS = ("vaapi", "nvenc", "software")
 HW_DECODE_MODES = ("auto", "no")
+KEEP_4K_MODES = ("no", "if-other-version", "yes")
+PROFILES = ("tv", "movies")
 HOURS_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 AUTH_MAX_FAILS = 10       # wrong passwords per IP ...
 AUTH_WINDOW = 10 * 60     # ... within this many seconds before we stop answering
@@ -64,28 +66,43 @@ def load_config():
     """Read reencode.conf through common.sh so bash and Python agree on it."""
     script = (
         'source "$1"; load_config >/dev/null 2>&1; '
-        'printf "%s\\0" "$CONFIG_PATH" "$LOG_DIR" "$TEMP_DIR" "$TARGET_HEIGHT" '
-        '"$QUALITY" "$ENCODER" "$VAAPI_DEVICE" "$HW_DECODE" "$ENCODE_HOURS"; '
-        'printf "%s\\0" "${LIBRARIES[@]}"'
+        'printf "%s\\0" "$CONFIG_PATH" "$LOG_DIR" "$TEMP_DIR" '
+        '"$ENCODER" "$VAAPI_DEVICE" "$HW_DECODE" "$ENCODE_HOURS" "$OVERRIDES_FILE" '
+        '"$TV_HEIGHT" "$TV_QUALITY" "$TV_KEEP_4K" "$MOVIES_HEIGHT" "$MOVIES_QUALITY" "$MOVIES_KEEP_4K"; '
+        'for l in "${LIBRARIES[@]}"; do printf "%s\\0%s\\0" "$l" "$(library_profile "$l")"; done'
     )
     out = subprocess.run(
         ["bash", "-c", script, "_", str(COMMON)],
         capture_output=True, check=True, stdin=subprocess.DEVNULL,
     ).stdout.decode("utf-8", "replace")
     parts = out.split("\0")[:-1]
-    keys = ["config_path", "log_dir", "temp_dir", "target_height", "quality", "encoder",
-            "vaapi_device", "hw_decode", "encode_hours"]
+    keys = ["config_path", "log_dir", "temp_dir", "encoder", "vaapi_device", "hw_decode",
+            "encode_hours", "overrides_file"]
+    prof_keys = ["tv_height", "tv_quality", "tv_keep_4k", "movies_height", "movies_quality",
+                 "movies_keep_4k"]
+    n = len(keys) + len(prof_keys)
     cfg = dict(zip(keys, parts[:len(keys)]))
-    cfg["libraries"] = [p for p in parts[len(keys):] if p]
+    raw = dict(zip(prof_keys, parts[len(keys):n]))
+    cfg["profiles"] = {}
+    for p in PROFILES:
+        try:
+            height = int(raw.get(f"{p}_height"))
+        except (TypeError, ValueError):
+            height = 720
+        try:
+            quality = int(raw.get(f"{p}_quality"))
+        except (TypeError, ValueError):
+            quality = 32
+        keep = raw.get(f"{p}_keep_4k")
+        cfg["profiles"][p] = {"height": height, "quality": quality,
+                              "keep_4k": keep if keep in KEEP_4K_MODES else "no"}
+    rest = parts[n:]
+    cfg["libraries"] = [rest[i] for i in range(0, len(rest) - 1, 2) if rest[i]]
+    cfg["library_profiles"] = [rest[i + 1] for i in range(0, len(rest) - 1, 2) if rest[i]]
     if cfg.get("hw_decode") not in HW_DECODE_MODES:
         cfg["hw_decode"] = "auto"
     if not HOURS_RE.match(cfg.get("encode_hours", "")):
         cfg["encode_hours"] = ""
-    for k in ("target_height", "quality"):
-        try:
-            cfg[k] = int(cfg[k])
-        except (KeyError, ValueError):
-            cfg[k] = 720 if k == "target_height" else 32
     return cfg
 
 
@@ -112,13 +129,18 @@ def validate_settings(data):
             errors[key] = f"Folder not found: {v}"
         return v.rstrip("/") or "/"
 
+    # Libraries: [{"path": "/media/TV", "profile": "tv"}, ...] (plain paths also accepted).
     libs = data.get("libraries", [])
     if isinstance(libs, str):
         libs = libs.splitlines()
     if not isinstance(libs, list):
         libs = []
-    clean_libs = []
+    clean_libs, clean_profiles = [], []
     for lib in libs:
+        prof = "auto"
+        if isinstance(lib, dict):
+            prof = lib.get("profile", "auto")
+            lib = lib.get("path", "")
         if not isinstance(lib, str) or not lib.strip():
             continue
         lib = lib.strip()
@@ -126,24 +148,38 @@ def validate_settings(data):
             errors["libraries"] = f"Invalid path: {lib}"
         elif not os.path.isdir(lib):
             errors["libraries"] = f"Folder not found: {lib}"
+        if prof not in PROFILES + ("auto",):
+            errors["libraries"] = "Each library must be TV or Movies"
         clean_libs.append(lib.rstrip("/") or "/")
+        clean_profiles.append(prof)
     if not clean_libs:
         errors.setdefault("libraries", "Add at least one library folder")
     clean["libraries"] = clean_libs
+    clean["library_profiles"] = clean_profiles
 
     clean["log_dir"] = path("log_dir")
     clean["temp_dir"] = path("temp_dir")
     dev = path("vaapi_device", required=False)
     clean["vaapi_device"] = dev or ""
 
-    for key, lo, hi in (("target_height", 144, 4320), ("quality", 0, 51)):
-        try:
-            n = int(data.get(key))
-            if not lo <= n <= hi:
-                raise ValueError
-            clean[key] = n
-        except (TypeError, ValueError):
-            errors[key] = f"Whole number between {lo} and {hi}"
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    clean["profiles"] = {}
+    for p in PROFILES:
+        src = profiles.get(p) if isinstance(profiles.get(p), dict) else {}
+        out = {}
+        for key, lo, hi in (("height", 144, 4320), ("quality", 0, 51)):
+            try:
+                n = int(src.get(key))
+                if not lo <= n <= hi:
+                    raise ValueError
+                out[key] = n
+            except (TypeError, ValueError):
+                errors[f"{p}_{key}"] = f"Whole number between {lo} and {hi}"
+        keep = src.get("keep_4k", "no")
+        if keep not in KEEP_4K_MODES:
+            errors[f"{p}_keep_4k"] = "Pick one of: " + ", ".join(KEEP_4K_MODES)
+        out["keep_4k"] = keep
+        clean["profiles"][p] = out
 
     enc = data.get("encoder")
     if enc not in ENCODERS:
@@ -166,24 +202,126 @@ def validate_settings(data):
 
 
 def save_config(s):
+    # Values travel as env vars/arguments, never spliced into the script.
     script = (
         'source "$1"; load_config >/dev/null 2>&1; shift; '
-        'LIBRARIES=("$@"); LOG_DIR=$R_LOG_DIR; TEMP_DIR=$R_TEMP_DIR; '
-        'TARGET_HEIGHT=$R_TARGET_HEIGHT; QUALITY=$R_QUALITY; ENCODER=$R_ENCODER; '
+        'LIBRARIES=(); LIBRARY_PROFILES=(); '
+        'while [ $# -gt 0 ]; do LIBRARIES+=("$1"); LIBRARY_PROFILES+=("$2"); shift 2; done; '
+        'LOG_DIR=$R_LOG_DIR; TEMP_DIR=$R_TEMP_DIR; ENCODER=$R_ENCODER; '
         'VAAPI_DEVICE=$R_VAAPI_DEVICE; HW_DECODE=$R_HW_DECODE; ENCODE_HOURS=$R_ENCODE_HOURS; '
+        'TV_HEIGHT=$R_TV_HEIGHT; TV_QUALITY=$R_TV_QUALITY; TV_KEEP_4K=$R_TV_KEEP_4K; '
+        'MOVIES_HEIGHT=$R_MOVIES_HEIGHT; MOVIES_QUALITY=$R_MOVIES_QUALITY; MOVIES_KEEP_4K=$R_MOVIES_KEEP_4K; '
         'write_config'
     )
     env = dict(os.environ)
     env.update({
         "R_LOG_DIR": s["log_dir"], "R_TEMP_DIR": s["temp_dir"],
-        "R_TARGET_HEIGHT": str(s["target_height"]), "R_QUALITY": str(s["quality"]),
         "R_ENCODER": s["encoder"], "R_VAAPI_DEVICE": s["vaapi_device"],
         "R_HW_DECODE": s["hw_decode"], "R_ENCODE_HOURS": s["encode_hours"],
     })
+    for p in PROFILES:
+        env[f"R_{p.upper()}_HEIGHT"] = str(s["profiles"][p]["height"])
+        env[f"R_{p.upper()}_QUALITY"] = str(s["profiles"][p]["quality"])
+        env[f"R_{p.upper()}_KEEP_4K"] = s["profiles"][p]["keep_4k"]
+    args = []
+    for lib, prof in zip(s["libraries"], s["library_profiles"]):
+        args += [lib, prof]
     subprocess.run(
-        ["bash", "-c", script, "_", str(COMMON), *s["libraries"]],
+        ["bash", "-c", script, "_", str(COMMON), *args],
         env=env, check=True, capture_output=True, stdin=subprocess.DEVNULL,
     )
+
+
+# ── Profiles and per-file plan (mirror of common.sh) ─────────────────────
+
+# ASCII-only, like `LC_ALL=C sed` in common.sh, so both sides always agree.
+MARKER_RE = re.compile(r"\b([0-9]{3,4}[pi]|[0-9]{3,4}x[0-9]{3,4}|4K|UHD)\b", re.I | re.ASCII)
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def group_key(base):
+    """Same as group_key() in common.sh: names that differ only by a resolution
+    marker are versions of the same video."""
+    s = MARKER_RE.sub("", base)
+    s = re.sub(r"[ ._-]{2,}", " ", s)
+    return s.strip(" ._-").translate(ASCII_LOWER)
+
+
+def plan_files(files, target, keep_4k, skip):
+    """Same rules as plan_title() in common.sh. files: dicts with "name" and
+    "height". Returns [(action, reason)] in the same order."""
+    keys = [group_key(os.path.splitext(f["name"])[0]) for f in files]
+    versions, small = collections.Counter(keys), {}
+    for f, k in zip(files, keys):
+        if f["height"] and f["height"] <= target:
+            small[k] = f["height"]
+    out, best = [], {}
+    for i, (f, k) in enumerate(zip(files, keys)):
+        h = f["height"]
+        if not h:
+            out.append(("unknown", "can't read the video"))
+        elif h <= target:
+            out.append(("ok", f"already {h}p"))
+        elif skip:
+            out.append(("skip", "set to never shrink"))
+        elif h >= 2160 and keep_4k == "yes":
+            out.append(("keep4k", "keeping 4K"))
+        elif h >= 2160 and keep_4k == "if-other-version" and versions[k] > 1:
+            out.append(("keep4k", "keeping 4K, another version exists"))
+        elif k in small:
+            out.append(("extra", f"a {small[k]}p version already exists"))
+        else:
+            out.append(("encode", f"shrink to {target}p"))
+            if k not in best or h > files[best[k]]["height"]:
+                best[k] = i
+    for i, k in enumerate(keys):
+        if out[i][0] == "encode" and best[k] != i:
+            out[i] = ("extra", "another version of this is being shrunk")
+    return out
+
+
+def guess_profile(lib):
+    name = os.path.basename(lib.rstrip("/")).lower()
+    return "movies" if "movie" in name or "film" in name else "tv"
+
+
+def title_settings(cfg, overrides, library, path):
+    """Profile settings for a title, with its per-title override applied
+    (same as apply_profile() in common.sh)."""
+    try:
+        prof = cfg["library_profiles"][cfg["libraries"].index(library)]
+    except (ValueError, IndexError):
+        prof = guess_profile(library)
+    if prof not in PROFILES:
+        prof = guess_profile(library)
+    p = cfg["profiles"][prof]
+    ov = overrides.get(path, "")
+    return {
+        "profile": prof, "height": int(ov) if ov.isdigit() else p["height"],
+        "default_height": p["height"], "quality": p["quality"], "keep_4k": p["keep_4k"],
+        "override": ov, "skip": ov == "skip",
+    }
+
+
+def read_overrides(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                val, _, title = line.rstrip("\n").partition("\t")
+                if title and (val == "skip" or val.isdigit()):
+                    out[title] = val
+    except OSError:
+        pass
+    return out
+
+
+def write_overrides(path, overrides):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for title, val in sorted(overrides.items()):
+            f.write(f"{val}\t{title}\n")
+    os.replace(tmp, path)
 
 
 def parse_hours(spec):
@@ -362,38 +500,42 @@ class Library:
         except OSError:
             pass
 
-    def summaries(self, target):
+    def summaries(self):
         out = []
         with self.lock:
             titles = list(self.titles.values())
         for t in titles:
-            above = at = below = unknown = 0
-            size = above_size = 0
-            above_secs = 0.0
-            for f in t["files"]:
-                size += f["size"]
-                h = f["height"]
-                if not h:
-                    unknown += 1
-                elif h > target:
-                    above += 1
-                    above_size += f["size"]
-                    above_secs += f["duration"] or 0
-                elif h == target:
-                    at += 1
-                else:
-                    below += 1
             if not t["files"]:
                 continue
-            if above == 0:
-                status = "done" if at else "n/a"
+            ts = self.app.title_settings(t)
+            plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"])
+            todo = done = unknown = at = 0
+            size = todo_size = 0
+            todo_secs = 0.0
+            for f, (action, _) in zip(t["files"], plan):
+                size += f["size"]
+                if action == "encode":
+                    todo += 1
+                    todo_size += f["size"]
+                    todo_secs += f["duration"] or 0
+                elif action == "unknown":
+                    unknown += 1
+                else:
+                    done += 1
+                if f["height"] == ts["height"]:
+                    at += 1
+            if ts["skip"]:
+                status = "skipped"
+            elif todo == 0:
+                status = "done" if done else "n/a"
             else:
                 status = "partial" if at else "ready"
             out.append({
                 "name": t["name"], "path": t["path"], "library": t["library"],
-                "files": len(t["files"]), "above": above, "at": at, "below": below,
-                "unknown": unknown, "size": size, "above_size": above_size,
-                "above_secs": above_secs, "status": status,
+                "files": len(t["files"]), "above": todo, "at": done, "unknown": unknown,
+                "size": size, "above_size": todo_size, "above_secs": todo_secs,
+                "status": status, "target": ts["height"], "profile": ts["profile"],
+                "override": ts["override"],
             })
         return out
 
@@ -696,11 +838,10 @@ class JobRunner:
         env = dict(os.environ, REENCODE_PROGRESS=progress)
         cmd = ["bash", str(SCRIPT), "--dir", job.path] + (["--dry-run"] if job.dry_run else [])
 
-        title = self.app.library.title(job.path)
+        title = self.app.title_detail(job.path)
         if title:
-            target = cfg["target_height"]
             job.todo = {os.path.basename(f["rel"]): f["duration"] or 0.0
-                        for f in title["files"] if f["height"] and f["height"] > target}
+                        for f in title["files"] if f["action"] == "encode"}
             job.total_todo = sum(job.todo.values())
 
         job.proc = subprocess.Popen(
@@ -833,12 +974,33 @@ class App:
     def __init__(self):
         self.password = ""
         self.config = load_config()
+        self.overrides = read_overrides(self.config["overrides_file"])
         set_state_dir(Path(self.config["config_path"]).parent)
         self.library = Library(self)
         self.jobs = JobRunner(self)
 
     def reload_config(self):
         self.config = load_config()
+        self.overrides = read_overrides(self.config["overrides_file"])
+
+    def title_settings(self, title):
+        return title_settings(self.config, self.overrides, title["library"], title["path"])
+
+    def title_detail(self, path):
+        t = self.library.title(path)
+        if not t:
+            return None
+        ts = self.title_settings(t)
+        plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"])
+        files = [dict(f, action=a, why=w) for f, (a, w) in zip(t["files"], plan)]
+        return dict(t, files=files, settings=ts)
+
+    def set_override(self, path, value):
+        if value:
+            self.overrides[path] = value
+        else:
+            self.overrides.pop(path, None)
+        write_overrides(self.config["overrides_file"], self.overrides)
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""
@@ -864,8 +1026,7 @@ class App:
 
     def state(self):
         cfg = self.config
-        target = cfg["target_height"]
-        titles = self.library.summaries(target)
+        titles = self.library.summaries()
         jobs = self.jobs.state()
         ratio = self.jobs.size_ratio()
         to_encode = sum(t["above_size"] for t in titles)
@@ -988,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/state":
             return self._send(200, app.state())
         if url.path == "/api/title":
-            t = app.library.title(q.get("path", [""])[0])
+            t = app.title_detail(q.get("path", [""])[0])
             if not t:
                 return self._send(404, {"error": "Not found"})
             return self._send(200, t)
@@ -1040,6 +1201,18 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/scan":
             app.library.request_scan()
             return self._send(200, {"ok": True})
+        if url.path == "/api/title/override":
+            path, value = data.get("path"), data.get("value", "")
+            if not isinstance(path, str) or not app.library.title(path) or re.search(r"[\t\n\r]", path):
+                return self._send(404, {"error": "Unknown title"})
+            value = str(value or "").strip().lower()
+            if value not in ("", "skip") and not (value.isdigit() and 144 <= int(value) <= 4320):
+                return self._send(422, {"error": "Use a resolution (e.g. 1080), 'skip', or nothing"})
+            try:
+                app.set_override(path, value)
+            except OSError as e:
+                return self._send(500, {"error": f"Couldn't save: {e}"})
+            return self._send(200, {"ok": True, "detail": app.title_detail(path)})
         if url.path == "/api/settings":
             clean, errors = validate_settings(data)
             if errors:
