@@ -419,6 +419,8 @@ class Library:
         self.scan_total = 0
         self.last_scan = None
         self.pending = None  # None, or set of title paths (empty = full)
+        self._summaries_cache = None
+        self._summaries_version = -1
         try:
             self.cache = json.loads(PROBE_CACHE.read_text())
         except (OSError, ValueError):
@@ -540,6 +542,7 @@ class Library:
                         self.titles.pop(tpath, None)
             self.last_scan = now()
             cache_copy = dict(self.cache)
+        self.app.invalidate()  # titles changed: drop the cached summaries
         tmp = PROBE_CACHE.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(cache_copy))
@@ -548,6 +551,19 @@ class Library:
             pass
 
     def summaries(self):
+        # Planning every file in the library costs ~66 ms for 10k files, and
+        # /api/state asks for this on every poll. The result only changes when
+        # a scan lands or the settings change, both of which bump app.version.
+        version = self.app.version
+        with self.lock:
+            if self._summaries_cache is not None and self._summaries_version == version:
+                return self._summaries_cache
+        out = self._compute_summaries()
+        with self.lock:
+            self._summaries_cache, self._summaries_version = out, version
+        return out
+
+    def _compute_summaries(self):
         out = []
         with self.lock:
             titles = list(self.titles.values())
@@ -1084,17 +1100,19 @@ def stop_job(job):
         pass
 
 
-_EXT_CACHE = (0.0, {})     # (monotonic timestamp, result) — /proc scan is costly
+_EXT_CACHE = (0.0, None, {})   # (monotonic time, own pid, result)
 
 
 def external_encodes():
     """reencode.sh runs not started by this dashboard (e.g. from encodetv)."""
     global _EXT_CACHE
-    cached_at, cached = _EXT_CACHE
-    if time.monotonic() - cached_at < 2.0:
-        return list(cached.values())
     job = _APP.jobs.current if _APP else None
     own = job.proc.pid if job and job.proc else None
+    # Keyed on our own pid too: a job that just started must not be served a
+    # scan taken before it existed, or we would report ourselves as external.
+    cached_at, cached_own, cached = _EXT_CACHE
+    if cached_own == own and time.monotonic() - cached_at < 2.0:
+        return list(cached.values())
     found = {}
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
@@ -1114,7 +1132,7 @@ def external_encodes():
         if sid == own:
             continue
         found.setdefault(sid, " ".join(a.decode("utf-8", "replace") for a in argv[1:] if a))
-    _EXT_CACHE = (time.monotonic(), found)
+    _EXT_CACHE = (time.monotonic(), own, found)
     return list(found.values())
 
 
@@ -1138,13 +1156,21 @@ class App:
         self.password = ""
         self.config = load_config()
         self.overrides = read_overrides(self.config["overrides_file"])
+        # Bumped whenever anything a title summary depends on changes, so
+        # Library.summaries() can cache instead of re-planning the library on
+        # every UI poll (~66 ms for 10k files).
+        self.version = 0
         set_state_dir(Path(self.config["config_path"]).parent)
         self.library = Library(self)
         self.jobs = JobRunner(self)
 
+    def invalidate(self):
+        self.version += 1
+
     def reload_config(self):
         self.config = load_config()
         self.overrides = read_overrides(self.config["overrides_file"])
+        self.invalidate()
 
     def library_of(self, path):
         """Which configured library a title path belongs to."""
@@ -1175,6 +1201,7 @@ class App:
         else:
             self.overrides.pop(path, None)
         write_overrides(self.config["overrides_file"], self.overrides)
+        self.invalidate()
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""

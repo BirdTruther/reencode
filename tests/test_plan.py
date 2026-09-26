@@ -5,6 +5,7 @@ with every file, across profiles, overrides and multi-version folders.
     python3 tests/test_plan.py        # needs ffmpeg/ffprobe
 """
 
+import inspect
 import json
 import os
 import subprocess
@@ -355,7 +356,6 @@ ENCODER="software"
         self.assertEqual(j.remaining_secs(), 50.0)       # current file still pending
 
     def test_external_scan_is_cached(self):
-        dashboard._EXT_CACHE = (0.0, {})
         calls = []
         real = dashboard.os.listdir
 
@@ -366,14 +366,98 @@ ENCODER="software"
         dashboard.os.listdir = spy
         try:
             dashboard._APP = None
-            dashboard._EXT_CACHE = (dashboard.time.monotonic() - 100, {})
+            stale = dashboard.time.monotonic() - 100
+            dashboard._EXT_CACHE = (stale, None, {})
             first = dashboard.external_encodes()
             second = dashboard.external_encodes()
         finally:
             dashboard.os.listdir = real
-            dashboard._EXT_CACHE = (0.0, {})
+            dashboard._EXT_CACHE = (0.0, None, {})
         self.assertEqual(first, second)
         self.assertEqual(len(calls), 1, "second call must be served from cache")
+
+    def test_external_cache_not_reused_for_a_new_job(self):
+        """A job that just started must not be served a scan from before it
+        existed, or the dashboard reports its own encode as an external one."""
+        calls = []
+        real = dashboard.os.listdir
+
+        def spy(p):
+            calls.append(p)
+            return real(p)
+
+        dashboard.os.listdir = spy
+        try:
+            dashboard._EXT_CACHE = (dashboard.time.monotonic(), None, {1: "stale"})
+            # Pretend our own job is now running under a different pid.
+            dashboard._APP = types.SimpleNamespace(
+                jobs=types.SimpleNamespace(current=types.SimpleNamespace(
+                    proc=types.SimpleNamespace(pid=4242))))
+            got = dashboard.external_encodes()
+        finally:
+            dashboard.os.listdir = real
+            dashboard._APP = None
+            dashboard._EXT_CACHE = (0.0, None, {})
+        self.assertEqual(len(calls), 1, "cache must miss when our own pid changes")
+        self.assertNotIn("stale", got)
+
+
+class SummariesCacheTest(unittest.TestCase):
+    """summaries() re-plans every file, so it must cache but never go stale."""
+
+    def setUp(self):
+        self.lock = threading.Lock()
+        self.app = types.SimpleNamespace(version=0, overrides={}, lock=self.lock)
+        self.app.title_settings = lambda t: {"height": 720, "keep_4k": "no", "skip": False,
+                                              "profile": "tv", "override": None}
+        self.lib = dashboard.Library.__new__(dashboard.Library)
+        self.lib.app = self.app
+        self.lib.lock = self.lock
+        self.lib._summaries_cache = None
+        self.lib._summaries_version = -1
+        self.lib.titles = {
+            "/media/TV/Show A": {"name": "Show A", "path": "/media/TV/Show A",
+                                 "library": "/media/TV", "files": [
+                {"name": "e01.mkv", "rel": "e01.mkv", "path": "/media/TV/Show A/e01.mkv",
+                 "size": 1000, "height": 1080, "cls": 1080, "duration": 100.0}]}}
+
+    def test_repeated_calls_are_served_from_cache(self):
+        first = self.lib.summaries()
+        calls = []
+        real = dashboard.plan_files
+        dashboard.plan_files = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        try:
+            second = self.lib.summaries()
+        finally:
+            dashboard.plan_files = real
+        self.assertEqual(first, second)
+        self.assertEqual(calls, [], "second call must not re-plan")
+
+    def test_new_version_replans(self):
+        self.lib.summaries()
+        # A file the scan replaced is now at target height.
+        self.lib.titles["/media/TV/Show A"]["files"][0]["height"] = 720
+        self.lib.titles["/media/TV/Show A"]["files"][0]["cls"] = 720
+        self.app.version += 1
+        out = self.lib.summaries()
+        self.assertEqual(out[0]["above"], 0)
+        self.assertEqual(out[0]["status"], "done")
+
+    def test_config_change_replans(self):
+        self.lib.summaries()
+        self.assertEqual(self.lib.summaries()[0]["above"], 1)
+        # Target raised above the file's height: nothing left to shrink.
+        self.app.title_settings = lambda t: {"height": 2160, "keep_4k": "no", "skip": False,
+                                             "profile": "tv", "override": None}
+        self.app.version += 1
+        out = self.lib.summaries()
+        self.assertEqual(out[0]["target"], 2160)
+        self.assertEqual(out[0]["above"], 0)
+
+    def test_invalidate_is_called_on_scan(self):
+        """The scan must bump the version, or the UI would show stale counts."""
+        src = inspect.getsource(dashboard.Library._scan)
+        self.assertIn("self.app.invalidate()", src)
 
 
 if __name__ == "__main__":
