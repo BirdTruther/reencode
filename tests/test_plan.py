@@ -5,10 +5,13 @@ with every file, across profiles, overrides and multi-version folders.
     python3 tests/test_plan.py        # needs ffmpeg/ffprobe
 """
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 from pathlib import Path
 
@@ -183,6 +186,194 @@ ENCODER="software"
                                        str(ROOT / "common.sh"), name],
                                       capture_output=True, text=True, check=True).stdout.strip()
                 self.assertEqual(bash, dashboard.group_key(name))
+
+
+class QueuePersistTest(unittest.TestCase):
+    """The queue must survive a restart, and an interrupted job must come back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        for lib in ("TV", "Movies"):
+            (self.base / lib / "Show Z" / "Season 1").mkdir(parents=True)
+        self.conf = self.base / "reencode.conf"
+        self.conf.write_text(f"""LIBRARIES=("{self.base}/TV" "{self.base}/Movies")
+LIBRARY_PROFILES=("tv" "movies")
+LOG_DIR="{self.base}/logs"
+TEMP_DIR="{self.base}/tmp"
+TV_HEIGHT=720
+TV_QUALITY=30
+TV_KEEP_4K="no"
+MOVIES_HEIGHT=720
+MOVIES_QUALITY=28
+MOVIES_KEEP_4K="if-other-version"
+ENCODER="software"
+""")
+        self.env = dict(os.environ, REENCODE_CONFIG=str(self.conf))
+
+    def make_runner(self):
+        """A JobRunner without worker threads or history side effects."""
+        os.environ["REENCODE_CONFIG"] = str(self.conf)
+        app = dashboard.App.__new__(dashboard.App)
+        app.config = dashboard.load_config()
+        app.overrides = dashboard.read_overrides(app.config["overrides_file"])
+        dashboard.set_state_dir(self.base)
+        app.library = types.SimpleNamespace(
+            title=lambda p: None, request_scan=lambda only=None: None)
+        app.jobs = dashboard.JobRunner.__new__(dashboard.JobRunner)
+        app.jobs.app = app
+        app.jobs.lock = threading.Lock()
+        app.jobs.wake = threading.Event()
+        app.jobs.queue = []
+        app.jobs.current = None
+        app.jobs.waiting_external = app.jobs.waiting_schedule = False
+        app.jobs.shutting_down = False
+        app.jobs.history = []
+        app.jobs._record = lambda job: None
+        app.jobs._load_queue()
+        self.jobs = app.jobs
+        return app.jobs
+
+    def enqueue(self, path, dry_run=False):
+        with self.jobs.lock:
+            job = dashboard.Job({"path": str(path), "name": path.name,
+                                 "library": str(self.base / "TV")}, dry_run)
+            self.jobs.queue.append(job)
+            self.jobs._save_queue()
+
+    def test_queue_survives_restart(self):
+        r = self.make_runner()
+        a = (self.base / "TV" / "Show Z").resolve()
+        b = (self.base / "Movies" / "Show Z").resolve()
+        self.enqueue(a)
+        self.enqueue(b, dry_run=True)
+
+        r2 = self.make_runner()  # simulate a restart
+        self.assertEqual([j.path for j in r2.queue], [str(a), str(b)])
+        self.assertEqual([j.dry_run for j in r2.queue], [False, True])
+
+    def test_interrupted_job_is_requeued_first(self):
+        """A job stopped mid-encode must come back, and be marked as interrupted."""
+        r = self.make_runner()
+        a = self.base / "TV" / "Show Z"
+        self.enqueue(a)
+        job = r.queue.pop(0)
+        r.current = job
+        r.shutting_down = True
+
+        # Mirror the worker's post-run bookkeeping in _worker().
+        with r.lock:
+            r.current = None
+            if r.shutting_down and job.status != "done":
+                job.status, job.finished, job.restarted = "queued", None, True
+                job.add_line("-- dashboard stopped mid-encode; queued again on restart --")
+                r.queue.insert(0, job)
+                r._save_queue()
+        self.assertEqual([j.path for j in r.queue], [str(a)])
+        self.assertTrue(r.queue[0].restarted)
+        self.assertEqual(r.queue[0].status, "queued")
+        self.assertIn("stopped mid-encode", " ".join(l for _, l in r.queue[0].log))
+
+        # Restart: the job is restored at the front and flagged as interrupted.
+        r2 = self.make_runner()
+        self.assertEqual([j.path for j in r2.queue], [str(a)])
+        self.assertTrue(r2.queue[0].restarted)
+        self.assertIn("interrupted by a restart", " ".join(l for _, l in r2.queue[0].log))
+
+    def test_finished_job_is_not_requeued(self):
+        """A job that actually finished before shutdown must be recorded, not requeued."""
+        r = self.make_runner()
+        a = self.base / "TV" / "Show Z"
+        self.enqueue(a)
+        job = r.queue.pop(0)
+        job.status = "done"
+        r.shutting_down = True
+        with r.lock:
+            r.current = None
+            if r.shutting_down and job.status != "done":
+                r.queue.insert(0, job)
+        self.assertEqual(r.queue, [])
+
+    def test_finished_queue_file_clears(self):
+        r = self.make_runner()
+        a = self.base / "TV" / "Show Z"
+        self.enqueue(a)
+        self.assertTrue(dashboard.QUEUE_FILE.exists())
+        r.cancel(r.queue[0].id)
+        self.assertEqual(r.queue, [])
+        self.assertEqual(json.loads(dashboard.QUEUE_FILE.read_text()), [])
+
+    def test_missing_folder_is_dropped(self):
+        r = self.make_runner()
+        keep = self.base / "TV" / "Show Z"
+        gone = self.base / "Movies" / "Show Z"
+        self.enqueue(keep)
+        self.enqueue(gone)
+        import shutil
+        shutil.rmtree(gone)
+        r._prune_stale()
+        self.assertEqual([j.path for j in r.queue], [str(keep)])
+
+    def test_corrupt_queue_file_ignored(self):
+        self.make_runner()
+        dashboard.QUEUE_FILE.write_text("{not json")
+        r = self.make_runner()
+        self.assertEqual(r.queue, [])
+
+    def test_library_of_picks_longest_match(self):
+        os.environ["REENCODE_CONFIG"] = str(self.conf)
+        app = dashboard.App.__new__(dashboard.App)
+        app.config = dashboard.load_config()
+        self.assertEqual(app.library_of(f"{self.base}/TV/Show Z"),
+                         f"{self.base}/TV")
+
+    def test_eta_survives_duplicate_basenames(self):
+        """Two files named the same must not collapse into one ETA entry."""
+        j = dashboard.Job({"path": "/x", "name": "x", "library": "/TV"}, False)
+        j.todo = [("video.mkv", 100.0), ("video.mkv", 200.0), ("other.mkv", 50.0)]
+        j.total_todo = 350.0
+        self.assertEqual(j.remaining_secs(), 350.0)
+
+        # The first entry is the file now being encoded; the later duplicate
+        # must still be counted, or the title ETA collapses to one file.
+        j.add_line("[1/3] Processing: video.mkv")
+        self.assertEqual(j.remaining_secs(), 350.0)
+        j.add_line("Duration: 100.0s")
+        j.out_time = 50.0
+        self.assertEqual(j.remaining_secs(), 300.0)      # 50 done of the 1st of 300
+
+        # The next "Processing:" line retires the previous file, so the 100s
+        # entry is dropped and the 200s duplicate becomes the current file.
+        j.add_line("[2/3] Processing: video.mkv")
+        self.assertEqual(j.remaining_secs(), 250.0)
+        j.add_line("Duration: 200.0s")
+        j.out_time = 200.0
+        self.assertEqual(j.remaining_secs(), 50.0)       # only "other.mkv" left
+
+        j.add_line("[3/3] Processing: other.mkv")
+        self.assertEqual(j.remaining_secs(), 50.0)       # current file still pending
+
+    def test_external_scan_is_cached(self):
+        dashboard._EXT_CACHE = (0.0, {})
+        calls = []
+        real = dashboard.os.listdir
+
+        def spy(p):
+            calls.append(p)
+            return real(p)
+
+        dashboard.os.listdir = spy
+        try:
+            dashboard._APP = None
+            dashboard._EXT_CACHE = (dashboard.time.monotonic() - 100, {})
+            first = dashboard.external_encodes()
+            second = dashboard.external_encodes()
+        finally:
+            dashboard.os.listdir = real
+            dashboard._EXT_CACHE = (0.0, {})
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1, "second call must be served from cache")
 
 
 if __name__ == "__main__":

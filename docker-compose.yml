@@ -4,7 +4,7 @@ services:
     # build: .                         # or build it yourself from this repo instead
     container_name: reencode
     restart: unless-stopped
-    stop_grace_period: 30s             # time to stop a running encode cleanly
+    stop_grace_period: 45s             # time to stop a running encode cleanly (matches install-service.sh)
     ports:
       - "8686:8686"
     devices:

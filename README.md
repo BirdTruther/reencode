@@ -62,13 +62,13 @@ If your tool has a reverse proxy (Cosmos does), point a URL at port 8686 and let
 
 ### Updating
 
-Pull the new image and recreate the container, ideally while nothing is encoding. If something is, it's stopped safely: queue that title again afterwards, and the episodes that already finished are reused.
-
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-In Cosmos or Portainer, use their update or recreate button. Your settings, history and password live in `/config` and are kept.
+In Cosmos or Portainer, use their update or recreate button. Your settings, queue, history and password live in `/config` and are kept.
+
+You can update while a title is encoding. The dashboard stops the current encode, puts the title back at the front of the queue, and picks it up again on the next start. Episodes that already finished are reused, so you only pay for what was left.
 
 ## Organizing your library
 

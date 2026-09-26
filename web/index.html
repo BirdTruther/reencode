@@ -618,7 +618,7 @@ function renderQueue() {
   $("#queueCount").textContent = q.length ? plural(q.length, "title") + (qEta ? ` · ${qEta}` : "") : "";
   $("#queueList").innerHTML = q.map((j, i) => `<li>
     <span class="qnum">${i + 1}</span>
-    <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}</span>
+    <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}${j.restarted ? ' <span class="badge b-na" title="Stopped by a restart or update; will pick up where it left off">Resumed</span>' : ""}</span>
     <span class="muted mono hide-sm">${(S.eta && approx(S.eta.per_job[j.id])) || ""}</span>
     <button class="btn sm ghost icon-btn" title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""} onclick="moveJob('${j.id}','up')">↑</button>
     <button class="btn sm ghost icon-btn" title="Move down" aria-label="Move down" ${i === q.length - 1 ? "disabled" : ""} onclick="moveJob('${j.id}','down')">↓</button>

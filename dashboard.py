@@ -39,7 +39,7 @@ COMMON = ROOT / "common.sh"
 INDEX_HTML = ROOT / "web" / "index.html"
 # State lives next to reencode.conf (set in App.__init__), so a Docker /config
 # volume keeps it.
-PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = None
+PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = QUEUE_FILE = None
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 ENCODERS = ("vaapi", "nvenc", "software")
@@ -635,8 +635,11 @@ class Job:
         self.paused = False
         self.paused_by = None        # "user" or "schedule"
         self.schedule_override = False
-        # For whole-title ETA: seconds of video still to encode, by file name.
-        self.todo = {}
+        self.restarted = False       # was interrupted by a restart, re-queued
+        # For whole-title ETA: seconds of video still to encode, in the order
+        # reencode.sh will process them. A list, not a dict, because two files
+        # in one title can share a basename (e.g. "video.mkv" in two folders).
+        self.todo = []
         self.total_todo = 0.0
         self.speed_avg = None        # smoothed encode speed (x realtime)
 
@@ -645,7 +648,7 @@ class Job:
         self.log.append((self.seq, line))
         m = RE_EPISODE.search(line)
         if m:
-            self.todo.pop(self.file, None)  # previous file is finished (or skipped)
+            self.drop_todo(self.file)  # previous file is finished (or skipped)
             self.episode, self.episodes, self.file = int(m[1]), int(m[2]), m[3]
             self.duration, self.out_time, self.fps, self.speed = None, 0.0, None, None
             self.file_started = now()
@@ -673,11 +676,20 @@ class Job:
             return
         self.speed_avg = sample if self.speed_avg is None else 0.85 * self.speed_avg + 0.15 * sample
 
+    def drop_todo(self, name):
+        """Remove the first still-pending entry for a file name."""
+        for i, (n, _) in enumerate(self.todo):
+            if n == name:
+                del self.todo[i]
+                return
+
     def remaining_secs(self):
         """Seconds of video left to encode in this title."""
-        left = sum(self.todo.values())
-        if self.file in self.todo:
-            left -= min(self.out_time, self.todo[self.file])
+        left = sum(d for _, d in self.todo)
+        for n, d in self.todo:
+            if n == self.file:
+                left -= min(self.out_time, d)
+                break
         return max(0.0, left)
 
     def public(self):
@@ -696,6 +708,7 @@ class Job:
         return {
             "id": self.id, "path": self.path, "name": self.name, "library": self.library,
             "dry_run": self.dry_run, "status": self.status, "created": self.created,
+            "restarted": self.restarted,
             "started": self.started, "finished": self.finished, "episode": self.episode,
             "episodes": self.episodes, "file": self.file, "file_pct": pct, "file_eta": eta,
             "fps": self.fps, "speed": self.speed, "replaced": self.replaced,
@@ -723,12 +736,66 @@ class JobRunner:
         self.current = None
         self.waiting_external = False
         self.waiting_schedule = False
+        self.shutting_down = False
         try:
             self.history = json.loads(HISTORY_FILE.read_text())
         except (OSError, ValueError):
             self.history = []
+        self._load_queue()
         threading.Thread(target=self._worker, daemon=True).start()
         threading.Thread(target=self._scheduler, daemon=True).start()
+
+    # ── Queue persistence ───────────────────────────────────────────────
+    # The queue lives in /config so it survives a container update or reboot.
+    # Re-encoding is idempotent (finished files are reused from the temp dir),
+    # so re-queueing an interrupted title is cheap and safe.
+    def _load_queue(self):
+        try:
+            saved = json.loads(QUEUE_FILE.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(saved, list):
+            return
+        for item in saved:
+            path = item.get("path") if isinstance(item, dict) else None
+            if not isinstance(path, str) or not path or not os.path.isdir(path):
+                continue
+            # Built from the path, not the library: the first scan may not have
+            # run yet on a cold start. _prune_stale() drops titles that are gone.
+            title = {"path": path, "name": os.path.basename(path),
+                     "library": self.app.library_of(path)}
+            job = Job(title, bool(item.get("dry_run")))
+            job.created = float(item.get("created") or now())
+            job.restarted = bool(item.get("interrupted"))
+            if job.restarted:
+                job.add_line("-- was interrupted by a restart; queued again --")
+            self.queue.append(job)
+        if self.queue:
+            print(f"Restored {len(self.queue)} queued job(s) from {QUEUE_FILE.name}")
+
+    def _prune_stale(self):
+        """Drop queued titles that no longer exist (renamed or deleted folders)."""
+        with self.lock:
+            keep = [j for j in self.queue if os.path.isdir(j.path)]
+            if len(keep) != len(self.queue):
+                for j in self.queue:
+                    if j not in keep:
+                        j.status, j.finished = "cancelled", now()
+                        j.add_line("-- folder no longer exists; removed from the queue --")
+                        self._record(j)
+                self.queue = keep
+                self._save_queue()
+
+    def _save_queue(self):
+        # caller holds self.lock
+        data = [{"path": j.path, "dry_run": j.dry_run, "created": j.created,
+                 "interrupted": j.restarted} for j in self.queue]
+        tmp = QUEUE_FILE.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data))
+            tmp.replace(QUEUE_FILE)
+        except OSError:
+            pass
 
     def enqueue(self, title, dry_run=False):
         with self.lock:
@@ -737,6 +804,7 @@ class JobRunner:
                     return j, False
             job = Job(title, dry_run)
             self.queue.append(job)
+            self._save_queue()
         self.wake.set()
         return job, True
 
@@ -746,6 +814,7 @@ class JobRunner:
                 if j.id == job_id:
                     self.queue.remove(j)
                     j.status, j.finished = "cancelled", now()
+                    self._save_queue()
                     self._record(j)
                     return True
             j = self.current
@@ -802,6 +871,7 @@ class JobRunner:
                 if j.id == job_id:
                     k = max(0, min(len(self.queue) - 1, i + delta))
                     self.queue.insert(k, self.queue.pop(i))
+                    self._save_queue()
                     return True
         return False
 
@@ -844,9 +914,10 @@ class JobRunner:
         while True:
             self.wake.wait(5)
             self.wake.clear()
+            self._prune_stale()
             while True:
                 with self.lock:
-                    if not self.queue:
+                    if self.shutting_down or not self.queue:
                         break
                 # Don't fight a terminal-started encode for the GPU.
                 if external_encodes():
@@ -864,6 +935,7 @@ class JobRunner:
                         break
                     job = self.queue.pop(0)
                     self.current = job
+                    self._save_queue()
                 try:
                     self._run(job)
                 except Exception as e:
@@ -872,8 +944,31 @@ class JobRunner:
                 with self.lock:
                     job.finished = job.finished or now()
                     self.current = None
-                    self._record(job)
-                self.app.library.request_scan([job.path])
+                    if self.shutting_down and job.status != "done":
+                        # Stopped mid-encode by a restart. Put the title back
+                        # instead of dropping it: reencode.sh reuses finished
+                        # files from the temp dir, so this resumes cheaply.
+                        job.status = "queued"
+                        job.finished = None
+                        job.restarted = True
+                        job.add_line("-- dashboard stopped mid-encode; "
+                                     "queued again on restart --")
+                        self.queue.insert(0, job)
+                        self._save_queue()
+                    else:
+                        self._record(job)
+                if not self.shutting_down:
+                    self.app.library.request_scan([job.path])
+
+    def begin_shutdown(self):
+        """Stop accepting new work and hand the in-flight job back to the queue."""
+        with self.lock:
+            self.shutting_down = True
+            job = self.current
+            if job and job.proc and job.proc.poll() is None:
+                job.cancel_requested = True
+                stop_job(job)
+        return job
 
     def _run(self, job):
         cfg = self.app.config
@@ -886,10 +981,20 @@ class JobRunner:
         cmd = ["bash", str(SCRIPT), "--dir", job.path] + (["--dry-run"] if job.dry_run else [])
 
         title = self.app.title_detail(job.path)
+        if not title:
+            # Resumed right after a restart: the library may not have scanned
+            # this folder yet, which would leave the ETA empty. Ask for it and
+            # give the scan a moment; the encode itself doesn't depend on this.
+            self.app.library.request_scan([job.path])
+            for _ in range(30):
+                time.sleep(1)
+                title = self.app.title_detail(job.path)
+                if title:
+                    break
         if title:
-            job.todo = {os.path.basename(f["rel"]): f["duration"] or 0.0
-                        for f in title["files"] if f["action"] == "encode"}
-            job.total_todo = sum(job.todo.values())
+            job.todo = [(os.path.basename(f["rel"]), f["duration"] or 0.0)
+                        for f in title["files"] if f["action"] == "encode"]
+            job.total_todo = sum(d for _, d in job.todo)
 
         job.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -924,7 +1029,9 @@ class JobRunner:
         while not stop.wait(1):
             try:
                 with open(path, "rb") as f:
-                    f.seek(max(0, os.path.getsize(path) - 4096))
+                    # ffmpeg's progress block can exceed 4 KB with long file
+                    # names and many streams, which truncates the earlier keys.
+                    f.seek(max(0, os.path.getsize(path) - 16384))
                     tail = f.read().decode("utf-8", "replace")
             except OSError:
                 continue
@@ -977,8 +1084,15 @@ def stop_job(job):
         pass
 
 
+_EXT_CACHE = (0.0, {})     # (monotonic timestamp, result) — /proc scan is costly
+
+
 def external_encodes():
     """reencode.sh runs not started by this dashboard (e.g. from encodetv)."""
+    global _EXT_CACHE
+    cached_at, cached = _EXT_CACHE
+    if time.monotonic() - cached_at < 2.0:
+        return list(cached.values())
     job = _APP.jobs.current if _APP else None
     own = job.proc.pid if job and job.proc else None
     found = {}
@@ -1000,6 +1114,7 @@ def external_encodes():
         if sid == own:
             continue
         found.setdefault(sid, " ".join(a.decode("utf-8", "replace") for a in argv[1:] if a))
+    _EXT_CACHE = (time.monotonic(), found)
     return list(found.values())
 
 
@@ -1009,12 +1124,13 @@ _APP = None
 # ── App / HTTP ─────────────────────────────────────────────────────────────
 
 def set_state_dir(d):
-    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE
+    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE, QUEUE_FILE
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
     PROBE_CACHE = d / ".dashboard_cache.json"
     HISTORY_FILE = d / ".dashboard_history.json"
     PASSWORD_FILE = d / ".dashboard_password"
+    QUEUE_FILE = d / ".dashboard_queue.json"
 
 
 class App:
@@ -1029,6 +1145,17 @@ class App:
     def reload_config(self):
         self.config = load_config()
         self.overrides = read_overrides(self.config["overrides_file"])
+
+    def library_of(self, path):
+        """Which configured library a title path belongs to."""
+        best = ""
+        for lib in self.config["libraries"]:
+            lib = lib.rstrip("/")
+            if path == lib or path.startswith(lib + "/"):
+                if len(lib) > len(best):
+                    best = lib
+        return best or (self.config["libraries"][0].rstrip("/")
+                        if self.config["libraries"] else "")
 
     def title_settings(self, title):
         return title_settings(self.config, self.overrides, title["library"], title["path"])
@@ -1365,15 +1492,19 @@ def main():
         pass
     finally:
         # Stop a running encode cleanly; reencode.sh removes its partial output.
-        job = _APP.jobs.current
+        # The worker then puts the job back on the queue, so a restart resumes
+        # the title instead of dropping it.
+        job = _APP.jobs.begin_shutdown()
         if job and job.proc and job.proc.poll() is None:
             print("Stopping current encode...")
-            job.cancel_requested = True
-            stop_job(job)
             try:
                 job.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 pass
+        with _APP.jobs.lock:
+            pending = len(_APP.jobs.queue)
+        if pending:
+            print(f"Queue saved: {pending} job(s) will resume on next start.")
 
 
 if __name__ == "__main__":
