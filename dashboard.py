@@ -802,10 +802,12 @@ class JobRunner:
                 self.queue = keep
                 self._save_queue()
 
-    def _save_queue(self):
-        # caller holds self.lock
+    def _save_queue(self, interrupted=None):
+        # caller holds self.lock. `interrupted`: a job being stopped by a
+        # shutdown, saved at the front so it survives even a hard kill.
+        jobs = ([interrupted] if interrupted else []) + self.queue
         data = [{"path": j.path, "dry_run": j.dry_run, "created": j.created,
-                 "interrupted": j.restarted} for j in self.queue]
+                 "interrupted": j.restarted or j is interrupted} for j in jobs]
         tmp = QUEUE_FILE.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(data))
@@ -982,6 +984,9 @@ class JobRunner:
             self.shutting_down = True
             job = self.current
             if job and job.proc and job.proc.poll() is None:
+                # Save it first: the worker re-queues it once the encode has
+                # stopped, but the process may exit (or be killed) before that.
+                self._save_queue(interrupted=job)
                 job.cancel_requested = True
                 stop_job(job)
         return job
@@ -1528,6 +1533,11 @@ def main():
                 job.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 pass
+            # The worker thread hands the stopped job back to the queue; let it
+            # finish before exiting (daemon threads die with the process).
+            deadline = time.monotonic() + 10
+            while _APP.jobs.current is not None and time.monotonic() < deadline:
+                time.sleep(0.05)
         with _APP.jobs.lock:
             pending = len(_APP.jobs.queue)
         if pending:
