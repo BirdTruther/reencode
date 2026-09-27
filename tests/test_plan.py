@@ -305,6 +305,60 @@ ENCODER="software"
         self.assertEqual(r.queue, [])
         self.assertEqual(json.loads(dashboard.QUEUE_FILE.read_text()), [])
 
+    def test_shutdown_persists_inflight_job_immediately(self):
+        """The in-flight job must reach disk before the worker hands it back.
+
+        The worker re-queues the job only after the encode process has exited
+        and it has finished its own cleanup. If the dashboard process dies in
+        that window (busy server, or a hard kill once the grace period is up),
+        an in-memory-only requeue is lost. So begin_shutdown() has to write the
+        job out itself. This asserts the durable state, with the worker given
+        no chance to run at all.
+        """
+        r = self.make_runner()
+        a = self.base / "TV" / "Show Z"
+        self.enqueue(a)
+        # The worker pops the job and starts it, which empties the saved queue.
+        job = r.queue.pop(0)
+        r.current = job
+        r._save_queue()
+        self.assertEqual(json.loads(dashboard.QUEUE_FILE.read_text()), [])
+
+        job.proc = types.SimpleNamespace(pid=os.getpid(), poll=lambda: None)
+        real_stop = dashboard.stop_job
+        dashboard.stop_job = lambda j: None          # never signal a real process
+        try:
+            r.begin_shutdown()
+        finally:
+            dashboard.stop_job = real_stop
+
+        saved = json.loads(dashboard.QUEUE_FILE.read_text())
+        self.assertEqual([e["path"] for e in saved], [str(a)])
+        self.assertTrue(saved[0]["interrupted"],
+                        "the saved job must be marked as resuming, not fresh")
+
+    def test_shutdown_keeps_queued_jobs_behind_the_inflight_one(self):
+        r = self.make_runner()
+        first = self.base / "TV" / "Show Z"
+        second = self.base / "Movies" / "Show Z"
+        self.enqueue(first)
+        job = r.queue.pop(0)
+        r.current = job
+        r._save_queue()
+        self.enqueue(second)
+
+        job.proc = types.SimpleNamespace(pid=os.getpid(), poll=lambda: None)
+        real_stop = dashboard.stop_job
+        dashboard.stop_job = lambda j: None
+        try:
+            r.begin_shutdown()
+        finally:
+            dashboard.stop_job = real_stop
+
+        saved = json.loads(dashboard.QUEUE_FILE.read_text())
+        self.assertEqual([e["path"] for e in saved], [str(first), str(second)])
+        self.assertEqual([e["interrupted"] for e in saved], [True, False])
+
     def test_missing_folder_is_dropped(self):
         r = self.make_runner()
         keep = self.base / "TV" / "Show Z"
