@@ -299,18 +299,18 @@ get_pix_fmt() {
 
 # Scale filters for one file's output size: ENC_VF (CPU decode) and GPU_VF
 # (GPU decode + scale; empty when there's no GPU path).
-# VAAPI: 10-bit+ sources use p010, not nv12. Forcing nv12 downconverted
-# HDR10 files to 8-bit and lost HDR bit depth; p010 keeps 10-bit.
-# $3 = source file, $4 = main stream index (both optional; without them
-# the old nv12 behaviour is kept, so old callers still work).
+# VAAPI output is ALWAYS 8-bit (nv12), regardless of source bit depth.
+# p010 used to be selected for 10-bit+ sources, but that makes hevc_vaapi
+# request VAProfileHEVCMain10, which many GPUs (e.g. AMD Polaris / RX 580:
+# Main10 has a decode entrypoint only, no EncSlice) cannot encode at all,
+# so every 10-bit file failed at encoder open -- on GPU decode and again
+# on the CPU-decode retry, which uses the same encoder. nv12 + -profile:v
+# main (set in reencode.sh) forces HEVC Main. This deliberately drops HDR
+# metadata / 10-bit depth: see the HDR note in reencode.sh.
+# $3/$4 (source file / stream) are accepted for call compatibility but
+# no longer change the format.
 set_filters() {
-    local ow="$1" oh="$2" fmt="nv12" pix=""
-    if [[ -n "${3:-}" ]]; then
-        pix=$(get_pix_fmt "$3" "${4:-v:0}")
-        case "$pix" in
-            *10*|*12*|*16*) fmt="p010" ;;
-        esac
-    fi
+    local ow="$1" oh="$2" fmt="nv12"
     case "$ENCODER" in
         vaapi)
             ENC_VF="scale=${ow}:${oh},format=${fmt},hwupload"
