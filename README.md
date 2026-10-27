@@ -12,6 +12,8 @@ A 1080p or 4K file shrunk to 720p (or a 4K file shrunk to 1080p) often comes out
 - **One click** to encode a show or movie, or everything at once, with a queue you can reorder
 - **Live progress**: speed, time left for the episode, the show and the whole queue, and a live log
 - **Pause, resume or stop** at any time
+- **Allow partial**: tick "Allow partial" when queuing in the dashboard (or `--allow-failures` on the command line) and the episodes that worked are replaced even if others in the same title fail
+- **Queued jobs survive a dashboard restart**, and each job gets its own log file
 - **Encoding hours** (e.g. overnight only), so it stays out of the way while you're watching
 - **Profiles for TV and movies**: e.g. TV at 720p and movies at 1080p, with per-title exceptions
 - **Keeps your 4K copies** if you like, and handles folders with several versions of the same movie
@@ -107,11 +109,13 @@ Each profile also decides what happens to **4K files**:
 - **Keep if another version**: if a folder has the same movie in 4K and another resolution (e.g. `Movie (2020) - 2160p.mkv` and `Movie (2020) - 1080p.mkv`), the 4K is left alone and only the other copy is shrunk. A 4K file on its own is still shrunk.
 - **Always keep**: 4K files are never touched.
 
+A single show or movie can override the profile: expand it in the dashboard and pick **4K files** for that title only — **Use profile**, **Keep 4K**, or **Shrink 4K**. That setting beats the profile, so it works both ways: keep a 4K copy while shrinking its 1080p copy to 720p, or shrink a solo 4K copy you no longer want to keep even when the profile says "Always keep". For movies, versions are judged folder-wide, so a `2160p WEB-DL` copy and a `1080p BluRay` copy in the same folder count as versions of each other.
+
 Resolution is judged the way Plex shows it: widescreen films count by their width, so a 3840×1600 movie is 4K and a 1920×800 one is 1080p. Shrinking keeps the shape of the picture, so a 2.40:1 movie at 720p becomes 1280×534, not a squashed or oversized 16:9 frame. Files with extra video streams (cover art, or the second layer of a Dolby Vision file) are judged by their main picture.
 
 When a folder has several versions of the same video, only one of them is ever shrunk, so they can't overwrite each other. If a small enough version already exists, the others are left as they are.
 
-**Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer.
+**Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer. VAAPI keeps 10-bit sources at 10-bit (p010) instead of downconverting HDR files to 8-bit.
 
 ## Security
 
@@ -164,6 +168,8 @@ Options: `--port 9000`, `--user someone`, `--uninstall`.
 ./reencode.sh --show "Backyard Birds"      # one show or movie
 ./reencode.sh --dry-run --show "Backyard Birds"   # preview only, changes nothing
 ./reencode.sh --plan --show "Backyard Birds"      # what would happen to each file, and why
+./reencode.sh --allow-failures --show "Backyard Birds"  # replace the episodes that worked, even if others fail
+./reencode.sh --clear-no-savings           # forget files that once didn't save space, then exit
 ./reencode.sh --help                       # all options
 ```
 </details>
@@ -188,6 +194,8 @@ Clone the repo and replace the `image:` line in `docker-compose.yml` with `build
 **"Permission denied" on `/dev/dri`.** Without Docker, add your user to the `video` and `render` groups (`sudo usermod -aG video,render $USER`), then log out and back in. With Docker, check that `/dev/dri` is passed to the container.
 
 **Something else failed.** Open **Recent jobs** in the dashboard and click **Log**. Full details for each file are in the `logs` folder.
+
+**A file keeps being skipped even though you changed quality.** Files that once didn't save space are skipped, but that skip is tied to the encoder, quality and target you used at the time — changing any of those retries the file. To retry without changing anything, use **Clear "no savings" list** in Settings, or `./reencode.sh --clear-no-savings`.
 
 **NVIDIA with Docker.** Install the NVIDIA Container Toolkit, use the commented `deploy:` section in `docker-compose.yml` instead of `/dev/dri`, and pick **NVENC** as the encoder in Settings.
 

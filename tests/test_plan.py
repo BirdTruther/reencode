@@ -101,6 +101,7 @@ ENCODER="software"
         cls.base = base
         cls.cfg = dashboard.load_config()
         cls.overrides = dashboard.read_overrides(cls.cfg["overrides_file"])
+        cls.keep4k_overrides = dashboard.read_4k_overrides(cls.cfg["overrides_4k_file"])
 
     @classmethod
     def tearDownClass(cls):
@@ -117,8 +118,9 @@ ENCODER="software"
             if p.suffix in (".mkv", ".mp4"):
                 info = dashboard.ffprobe(str(p))
                 files.append({"name": p.name, "path": str(p), "height": info["height"], "cls": info["cls"]})
-        ts = dashboard.title_settings(self.cfg, self.overrides, str(self.base / lib), str(title_dir))
-        plan = dashboard.plan_files(files, ts["height"], ts["keep_4k"], ts["skip"])
+        ts = dashboard.title_settings(self.cfg, self.overrides, str(self.base / lib), str(title_dir),
+                                      self.keep4k_overrides)
+        plan = dashboard.plan_files(files, ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
         return {f["path"]: a for f, (a, _) in zip(files, plan)}
 
     def test_bash_and_python_agree(self):
@@ -183,6 +185,185 @@ ENCODER="software"
                                        str(ROOT / "common.sh"), name],
                                       capture_output=True, text=True, check=True).stdout.strip()
                 self.assertEqual(bash, dashboard.group_key(name))
+
+
+class PerTitle4KTest(unittest.TestCase):
+    """Per-title 4K settings beat the profile, in both planners.
+
+    - Solo 4K with a profile that says "always keep" + per-title "shrink"
+      must encode (previously: keep4k, 0 files to do, title vanished).
+    - A pair with a profile that says "shrink 4K too" + per-title "keep"
+      must keep the 4K copy and still shrink the 1080p copy.
+    - Differently-named copies in a movie folder (2160p WEB-DL vs
+      1080p BluRay) count as versions of each other, so only the
+      1080p copy is shrunk and the two never collide on one output name.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        base = Path(cls.tmp.name)
+        make_video(base / "Movies" / "Solo (2022)" / "Solo (2022) 2160p.mkv", 2160)
+        make_video(base / "Movies" / "Pair (2021)" / "Pair (2021) 2160p.mkv", 2160)
+        make_video(base / "Movies" / "Pair (2021)" / "Pair (2021) 1080p.mkv", 1080)
+        make_video(base / "Movies" / "Suffix (2020)" / "Suffix (2020) 2160p WEB-DL.mkv", 2160)
+        make_video(base / "Movies" / "Suffix (2020)" / "Suffix (2020) 1080p BluRay.mkv", 1080)
+        cls.base = base
+        (base / "title_4k.tsv").write_text(
+            f"shrink\t{base}/Movies/Solo (2022)\nkeep\t{base}/Movies/Pair (2021)\n")
+        cls.confs = {}
+        for name, keep, height in (("keep_yes", "yes", 1080), ("keep_no", "no", 720),
+                                   ("keep_other", "if-other-version", 720)):
+            conf = base / f"{name}.conf"
+            conf.write_text(f"""LIBRARIES=("{base}/Movies")
+LIBRARY_PROFILES=("movies")
+LOG_DIR="{base}/logs"
+TEMP_DIR="{base}/tmp"
+MOVIES_HEIGHT={height}
+MOVIES_QUALITY=28
+MOVIES_KEEP_4K="{keep}"
+ENCODER="software"
+""")
+            cls.confs[name] = conf
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _cfg(self, name):
+        os.environ["REENCODE_CONFIG"] = str(self.confs[name])
+        cfg = dashboard.load_config()
+        return cfg, dashboard.read_overrides(cfg["overrides_file"]), \
+            dashboard.read_4k_overrides(cfg["overrides_4k_file"])
+
+    def _bash_plan(self, title_dir, conf):
+        env = dict(os.environ, REENCODE_CONFIG=str(conf))
+        out = subprocess.run(["bash", str(ROOT / "reencode.sh"), "--plan", "--dir", str(title_dir)],
+                             capture_output=True, text=True, check=True, env=env).stdout
+        return {line.split("\t")[3]: line.split("\t")[0] for line in out.splitlines() if line.count("\t") == 3}
+
+    def _python_plan(self, title_dir, cfg, overrides, keep4k):
+        files = []
+        for p in sorted(title_dir.rglob("*")):
+            if p.suffix in (".mkv", ".mp4"):
+                info = dashboard.ffprobe(str(p))
+                files.append({"name": p.name, "path": str(p), "height": info["height"], "cls": info["cls"]})
+        ts = dashboard.title_settings(cfg, overrides, str(self.base / "Movies"), str(title_dir), keep4k)
+        plan = dashboard.plan_files(files, ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
+        return {f["path"]: a for f, (a, _) in zip(files, plan)}
+
+    def _check(self, name, title, expected):
+        cfg, overrides, keep4k = self._cfg(name)
+        d = self.base / "Movies" / title
+        want = {str(d / n): a for n, a in expected.items()}
+        self.assertEqual(self._bash_plan(d, self.confs[name]), want)
+        self.assertEqual(self._python_plan(d, cfg, overrides, keep4k), want)
+
+    def test_solo_4k_shrink_beats_always_keep(self):
+        self._check("keep_yes", "Solo (2022)", {"Solo (2022) 2160p.mkv": "encode"})
+
+    def test_pair_keep_beats_shrink_4k(self):
+        self._check("keep_no", "Pair (2021)", {
+            "Pair (2021) 2160p.mkv": "keep4k", "Pair (2021) 1080p.mkv": "encode"})
+
+    def test_suffix_copies_are_versions_of_each_other(self):
+        self._check("keep_other", "Suffix (2020)", {
+            "Suffix (2020) 2160p WEB-DL.mkv": "keep4k",
+            "Suffix (2020) 1080p BluRay.mkv": "encode"})
+
+
+class NoSavingsTest(unittest.TestCase):
+    def test_keyed_by_settings_and_old_plain_entries_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = f'''
+                source "{ROOT / "common.sh"}"
+                LOG_DIR="{d}/logs"; ENCODER="vaapi"; QUALITY=32; TARGET_HEIGHT=720
+                record_no_savings "/media/Movies/Film (2020) 1080p.mkv"
+                if is_no_savings "/media/Movies/Film (2020) 1080p.mkv"; then echo SAME; else echo NOT_SAME; fi
+                QUALITY=28
+                if is_no_savings "/media/Movies/Film (2020) 1080p.mkv"; then echo SAME_AFTER_CHANGE; else echo RETRY_AFTER_CHANGE; fi
+                echo "/media/Movies/Film (2020) 1080p.mkv" >> "$(NO_SAVINGS_LIST)"
+                if is_no_savings "/media/Movies/Film (2020) 1080p.mkv"; then echo PLAIN_BLOCKS; else echo PLAIN_IGNORED; fi
+                clear_no_savings
+                test -f "$(NO_SAVINGS_LIST)" && echo STILL_THERE || echo CLEARED
+            '''
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+            self.assertIn("SAME\n", out)
+            self.assertIn("RETRY_AFTER_CHANGE\n", out)
+            self.assertIn("PLAIN_IGNORED\n", out)
+            self.assertIn("CLEARED\n", out)
+
+
+class VaapiFiltersTest(unittest.TestCase):
+    def test_10bit_uses_p010_and_8bit_uses_nv12(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            run_ffmpeg("-f", "lavfi", "-i", "color=size=1280x720:duration=0.2",
+                       "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-preset", "ultrafast",
+                       str(base / "10bit.mkv"))
+            run_ffmpeg("-f", "lavfi", "-i", "color=size=1280x720:duration=0.2",
+                       "-c:v", "libx264", "-preset", "ultrafast", str(base / "8bit.mkv"))
+            script = f'''
+                source "{ROOT / "common.sh"}"
+                ENCODER="vaapi"
+                set_filters 1280 720 "{base / "10bit.mkv"}" 0
+                echo "10bit: $ENC_VF $GPU_VF"
+                set_filters 1280 720 "{base / "8bit.mkv"}" 0
+                echo "8bit: $ENC_VF $GPU_VF"
+            '''
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+            self.assertIn("10bit: scale=1280:720,format=p010,hwupload scale_vaapi=w=1280:h=720:format=p010", out)
+            self.assertIn("8bit: scale=1280:720,format=nv12,hwupload scale_vaapi=w=1280:h=720:format=nv12", out)
+
+
+class VerifyOnlyTest(unittest.TestCase):
+    def test_widescreen_720p_class_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / "tmp").mkdir()
+            make_video(base / "tmp" / "Wide 720p.mkv", "1280x534", duration=0.5)
+            conf = base / "reencode.conf"
+            conf.write_text(f"""LIBRARIES=("{base}/Movies")
+LIBRARY_PROFILES=("movies")
+LOG_DIR="{base}/logs"
+TEMP_DIR="{base}/tmp"
+TV_HEIGHT=720
+TV_QUALITY=30
+TV_KEEP_4K="no"
+MOVIES_HEIGHT=1080
+MOVIES_QUALITY=28
+MOVIES_KEEP_4K="if-other-version"
+ENCODER="software"
+""")
+            env = dict(os.environ, REENCODE_CONFIG=str(conf))
+            out = subprocess.run(["bash", str(ROOT / "reencode.sh"), "--verify-only"],
+                                 capture_output=True, text=True, env=env).stdout
+            self.assertIn("Verified: 1/1", out)
+
+
+class DashboardJobsTest(unittest.TestCase):
+    def test_job_log_name_is_unique_and_allow_failures_is_public(self):
+        a = dashboard.Job({"path": "/media/Movies/Film", "name": "Film", "library": "/media/Movies"},
+                          False, True)
+        b = dashboard.Job({"path": "/media/TV/Film", "name": "Film", "library": "/media/TV"}, False)
+        self.assertNotEqual(a.log_name(), b.log_name())
+        self.assertTrue(a.log_name().startswith(a.id + "_"))
+        self.assertTrue(a.public()["allow_failures"])
+        self.assertFalse(b.public()["allow_failures"])
+
+    def test_queue_save_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "queue.json"
+            a = dashboard.Job({"path": "/media/Movies/Film", "name": "Film", "library": "/media/Movies"},
+                              False, True)
+            dashboard.save_queue([a], path)
+            loaded = dashboard.load_queue(path)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["path"], "/media/Movies/Film")
+            self.assertTrue(loaded[0]["allow_failures"])
+            self.assertEqual(loaded[0]["created"], a.created)
+            self.assertEqual(dashboard.load_queue(Path(d) / "missing.json"), [])
+            self.assertEqual(dashboard.load_queue(path.with_suffix(".bad")), [])
 
 
 if __name__ == "__main__":

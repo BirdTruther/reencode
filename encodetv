@@ -31,7 +31,7 @@ done
 
 # Load cache: path<TAB>size<TAB>total<TAB>to_shrink<TAB>done<TAB>scanned_epoch
 # First line records the profile settings; changing them invalidates the cache.
-CACHE_KEY="#profiles=${TV_HEIGHT}/${TV_KEEP_4K}/${MOVIES_HEIGHT}/${MOVIES_KEEP_4K}/${LIBRARY_PROFILES[*]}/$(cksum 2>/dev/null < "${OVERRIDES_FILE}" | cut -d' ' -f1)"
+CACHE_KEY="#profiles=${TV_HEIGHT}/${TV_KEEP_4K}/${MOVIES_HEIGHT}/${MOVIES_KEEP_4K}/${LIBRARY_PROFILES[*]}/$(cksum 2>/dev/null < "${OVERRIDES_FILE}" | cut -d' ' -f1)/$(cksum 2>/dev/null < "${OVERRIDES_4K_FILE:-}" | cut -d' ' -f1)"
 declare -A CACHE_SIZE CACHE_TOTAL CACHE_1080 CACHE_720 CACHE_TIME
 if [[ -f "$CACHE_FILE" && "$(head -1 "$CACHE_FILE")" == "$CACHE_KEY" ]]; then
     while IFS=$'\t' read -r name size total c1080 c720 ctime; do
