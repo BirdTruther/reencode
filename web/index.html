@@ -301,6 +301,7 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
         <option value="size">Size</option>
         <option value="todo">Most to encode</option>
       </select>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap" title="Replace the episodes that worked even if others in the same title fail"><input type="checkbox" id="allowFailuresChk"> Allow partial</label>
     </div>
     <div style="overflow-x:auto">
       <table class="lib">
@@ -377,6 +378,8 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
         </div>
       </div>
       <div class="hint">Saved to <span class="mono" id="cfgPath"></span>. Encoder changes apply from the next job; encoding hours apply right away.</div>
+      <div><button type="button" class="btn sm" id="clearNoSavings">Clear “no savings” list</button>
+      <div class="hint">Files that once didn't save space are skipped until you change encoder, quality or target, or clear this list.</div></div>
     </div>
     <div class="dlg-f">
       <button class="btn" value="cancel">Cancel</button>
@@ -398,7 +401,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 let S = null;                       // last /api/state
-const ui = load("ui", { lib: "all", status: "work", sort: "name", logOpen: false });
+const ui = load("ui", { lib: "all", status: "work", sort: "name", logOpen: false, allow_failures: false });
 const expanded = new Set();         // title paths
 const detailCache = new Map();      // path -> detail json
 let libKey = "";
@@ -618,7 +621,7 @@ function renderQueue() {
   $("#queueCount").textContent = q.length ? plural(q.length, "title") + (qEta ? ` · ${qEta}` : "") : "";
   $("#queueList").innerHTML = q.map((j, i) => `<li>
     <span class="qnum">${i + 1}</span>
-    <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}</span>
+    <span class="qname">${esc(j.name)} <span class="libtag">${esc(libName(j.library))}</span>${j.dry_run ? ' <span class="badge b-na">Preview</span>' : ""}${j.allow_failures ? ' <span class="badge b-na">Partial OK</span>' : ""}</span>
     <span class="muted mono hide-sm">${(S.eta && approx(S.eta.per_job[j.id])) || ""}</span>
     <button class="btn sm ghost icon-btn" title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""} onclick="moveJob('${j.id}','up')">↑</button>
     <button class="btn sm ghost icon-btn" title="Move down" aria-label="Move down" ${i === q.length - 1 ? "disabled" : ""} onclick="moveJob('${j.id}','down')">↓</button>
@@ -669,9 +672,10 @@ function renderLibrary() {
   $("#statusTabs").innerHTML = Object.entries(STATUS).map(([k, s]) =>
     `<button class="tab" role="tab" aria-selected="${ui.status === k}" data-status="${k}">${s.label}<span class="n">${inLib.filter(s.test).length}</span></button>`).join("");
   $("#sort").value = ui.sort;
+  $("#allowFailuresChk").checked = !!ui.allow_failures;
 
   const v = visibleTitles();
-  const key = JSON.stringify([v.map(t => [t.path, t.above, t.at, t.files, t.size, t.status]), S.jobs.current?.path, S.jobs.current?.paused, S.jobs.queue.map(q => q.path), [...expanded], S.config.profiles, S.stats.size_ratio, libs.length, v.map(t => t.override)]);
+  const key = JSON.stringify([v.map(t => [t.path, t.above, t.at, t.files, t.size, t.status]), S.jobs.current?.path, S.jobs.current?.paused, S.jobs.queue.map(q => q.path), [...expanded], S.config.profiles, S.stats.size_ratio, libs.length, v.map(t => [t.override, t.keep_4k_override])]);
   const q = v.filter(t => t.above > 0 && !jobFor(t.path));
   $("#queueVisibleBtn").disabled = !q.length;
   $("#queueVisibleBtn").textContent = q.length ? `Encode all shown (${q.length})` : "Encode all shown";
@@ -708,7 +712,7 @@ function renderLibrary() {
 }
 
 // Fingerprint of a title's summary; a cached file list is refetched when it changes.
-const detailFp = t => t ? JSON.stringify([t.above, t.at, t.files, t.size, t.target, t.override, t.status]) : "";
+const detailFp = t => t ? JSON.stringify([t.above, t.at, t.files, t.size, t.target, t.override, t.keep_4k_override, t.status]) : "";
 const ACTION = { encode: "to shrink", ok: "", keep4k: "kept", extra: "left as is", skip: "never shrink", unknown: "unreadable" };
 
 function detailHtml(path) {
@@ -719,7 +723,10 @@ function detailHtml(path) {
   const def = `Default (${PROFILE_LABEL[st.profile] || "TV"} · ${st.default_height}p)`;
   const opts = [["", def], ...HEIGHTS.map(h => [String(h), h + "p"]), ["skip", "Never shrink"]]
     .map(([v, n]) => `<option value="${v}" ${v === (st.override || "") ? "selected" : ""}>${n}</option>`).join("");
+  const k4kOpts = [["", `Use profile (${KEEP4K[st.profile_keep_4k] || "Shrink them too"})`], ["keep", "Keep 4K"], ["shrink", "Shrink 4K"]]
+    .map(([v, n]) => `<option value="${v}" ${v === (st.keep_4k_override || "") ? "selected" : ""}>${n}</option>`).join("");
   return `<div class="title-set"><label>Shrink to <select data-act="override" aria-label="Resolution for this title">${opts}</select></label>
+      <label>4K files <select data-act="keep4k" aria-label="4K handling for this title">${k4kOpts}</select></label>
       <span class="muted">Only for this title. The ${PROFILE_LABEL[st.profile] || "TV"} profile is used otherwise.</span></div>
     <table class="files">${d.files.map(f => {
     const cls = !f.height ? "lo" : f.action === "encode" ? "hi" : f.action === "ok" && f.cls === st.height ? "ok" : "lo";
@@ -753,6 +760,15 @@ async function setOverride(path, value) {
   } catch (e) { toast(e.message, true); }
 }
 
+async function setKeep4k(path, value) {
+  try {
+    await api("/api/title/override", { path, keep_4k: value });
+    detailCache.delete(path);
+    toast(value === "keep" ? "This title's 4K files will be kept" : value === "shrink" ? "This title's 4K files will be shrunk" : "Using the profile's 4K setting again");
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
 function renderHistory() {
   const h = S.jobs.history;
   $("#histCard").hidden = !h.length;
@@ -777,7 +793,7 @@ function renderHistory() {
 /* ── actions ───────────────────────────────────────────── */
 async function queue(paths, dry) {
   try {
-    const r = await api("/api/jobs", { paths, dry_run: !!dry });
+    const r = await api("/api/jobs", { paths, dry_run: !!dry, allow_failures: !dry && !!ui.allow_failures });
     toast(r.added ? `${dry ? "Preview" : "Encode"} queued for ${plural(r.added, "title")}` : "Already queued");
     refresh();
   } catch (e) { toast(e.message, true); }
@@ -809,6 +825,7 @@ async function showLog(id) {
 
 $("#libBody").addEventListener("change", e => {
   if (e.target.dataset.act === "override") setOverride(e.target.closest("tr").previousElementSibling.dataset.path, e.target.value);
+  if (e.target.dataset.act === "keep4k") setKeep4k(e.target.closest("tr").previousElementSibling.dataset.path, e.target.value);
 });
 $("#libBody").addEventListener("click", e => {
   const b = e.target.closest("[data-act]"); if (!b) return;
@@ -821,6 +838,7 @@ $("#libTabs").addEventListener("click", e => { const b = e.target.closest("[data
 $("#statusTabs").addEventListener("click", e => { const b = e.target.closest("[data-status]"); if (b) { ui.status = b.dataset.status; save("ui", ui); libKey = ""; renderLibrary(); } });
 $("#search").addEventListener("input", () => { libKey = ""; renderLibrary(); });
 $("#sort").addEventListener("change", e => { ui.sort = e.target.value; save("ui", ui); libKey = ""; renderLibrary(); });
+$("#allowFailuresChk").addEventListener("change", e => { ui.allow_failures = e.target.checked; save("ui", ui); });
 $("#queueVisibleBtn").addEventListener("click", () => { const set = new Set(visibleTitles().map(t => t.path)); queueWhere(t => set.has(t.path) && t.above > 0); });
 $("#rescanBtn").addEventListener("click", async () => { detailCache.clear(); await api("/api/scan", {}).catch(e => toast(e.message, true)); toast("Rescanning library"); refresh(); schedule(); });
 
@@ -882,6 +900,10 @@ function clearErrors() { document.querySelectorAll("#settingsForm .field").forEa
 $("#settingsForm").encoder.addEventListener("change", syncEncoder);
 $("#settingsBtn").addEventListener("click", openSettings);
 $("#addLib").addEventListener("click", () => { const r = libRow("", "tv"); $("#libRows").append(r); r.querySelector("input").focus(); });
+$("#clearNoSavings").addEventListener("click", async () => {
+  try { const r = await api("/api/no-savings/clear", {}); toast(r.cleared ? "“No savings” list cleared" : "“No savings” list was already empty"); refresh(); }
+  catch (e) { toast(e.message, true); }
+});
 $("#saveSettings").addEventListener("click", async e => {
   e.preventDefault();
   const f = $("#settingsForm");

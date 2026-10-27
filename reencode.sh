@@ -12,6 +12,7 @@ ALL=false
 SINGLE_SHOW=""
 SHOW_DIR=""
 VERIFY_ONLY=false
+CLEAR_NO_SAVINGS=false
 FORCE=false
 ALLOW_FAILURES=false
 SETUP=false
@@ -32,6 +33,7 @@ Options:
   --dry-run           Preview without encoding
   --plan              Print what would happen to each file (action, height, reason, path)
   --verify-only       Check re-encoded files in temp dir
+  --clear-no-savings  Forget files that once didn't save space, then exit
   --force             Re-encode even if temp file exists
   --allow-failures    Replace the episodes that succeeded even if others failed
   --max N             Stop after N files (testing; originals are not replaced)
@@ -62,6 +64,7 @@ parse_args() {
                 esac
                 shift 2 ;;
             --verify-only) VERIFY_ONLY=true; shift ;;
+            --clear-no-savings) CLEAR_NO_SAVINGS=true; shift ;;
             --force) FORCE=true; shift ;;
             --allow-failures) ALLOW_FAILURES=true; shift ;;
             --setup) SETUP=true; shift ;;
@@ -150,23 +153,8 @@ setup_encoder() {
     esac
 }
 
-# Scale filters for one file's output size: ENC_VF (CPU decode) and GPU_VF
-# (GPU decode + scale; empty when there's no GPU path).
-set_filters() {
-    local ow="$1" oh="$2"
-    case "$ENCODER" in
-        vaapi)
-            ENC_VF="scale=${ow}:${oh},format=nv12,hwupload"
-            GPU_VF="scale_vaapi=w=${ow}:h=${oh}:format=nv12" ;;
-        nvenc)
-            ENC_VF="scale=${ow}:${oh}"
-            GPU_VF="scale_cuda=${ow}:${oh}" ;;
-        *)
-            ENC_VF="scale=${ow}:${oh}"
-            GPU_VF="" ;;
-    esac
-}
-
+# Scale filters live in common.sh (set_filters), so tests can call them
+# without running reencode.sh.
 # Size a source should be shrunk to under the current profile (sets OUT_W, OUT_H).
 output_dims() {
     probe_video "$1" || return 1
@@ -216,12 +204,7 @@ verify_output() {
     return 0
 }
 
-NO_SAVINGS_LIST() { echo "${LOG_DIR}/.no_savings"; }
-
-is_no_savings() {
-    [[ -f "$(NO_SAVINGS_LIST)" ]] && grep -Fxq -- "$1" "$(NO_SAVINGS_LIST)"
-}
-
+# No-savings helpers live in common.sh (keyed by encoder/quality/target).
 # Returns 0 = encoded (or ready in temp), 1 = failed, 2 = skipped.
 encode_file() {
     local input="$1"
@@ -269,8 +252,8 @@ encode_file() {
         log_err "FAILED: can't read the video in $filename"
         return 1
     fi
-    set_filters "$OUT_W" "$OUT_H"
     local stream=${STREAMS["$input"]:-$V_INDEX}
+    set_filters "$OUT_W" "$OUT_H" "$input" "$stream"
 
     duration=$(get_duration "$input")
     log "Encoding: $filename [$(res_label "${CLASSES["$input"]:-$height}") ${WIDTHS["$input"]:-?}x${height}, ${codec}, ${original_size_mb}MB] -> ${OUT_W}x${OUT_H}"
@@ -395,7 +378,7 @@ replace_original() {
 
     if [[ $(stat -c%s "$outfile") -ge $(stat -c%s "$input") ]]; then
         log_warn "No savings for $filename (${original_size_mb}MB -> ${new_size_mb}MB), keeping original"
-        echo "$input" >> "$(NO_SAVINGS_LIST)"
+        record_no_savings "$input"
         rm -f "$outfile"
         return 0
     fi
@@ -615,19 +598,42 @@ main() {
     setup_dirs
     trap on_interrupt INT TERM
 
+    if [[ "$CLEAR_NO_SAVINGS" == true ]]; then
+        clear_no_savings
+        log_ok "Cleared no-savings list ($(NO_SAVINGS_LIST))"
+        return 0
+    fi
+
     if [[ "$VERIFY_ONLY" == true ]]; then
         log "Verification mode: checking re-encoded files in $TEMP_DIR"
-        local count=0 valid=0 f height size_mb
+        # Valid targets are resolution *classes* (like Plex), not stored
+        # heights: a correct 720p widescreen file is 1280x534, class 720.
+        # Include per-title override heights, which are also valid targets.
+        local -a valid_classes=("$TV_HEIGHT" "$MOVIES_HEIGHT")
+        if [[ -f "${OVERRIDES_FILE:-}" ]]; then
+            local ov_val ov_path
+            while IFS=$'\t' read -r ov_val ov_path; do
+                [[ "$ov_val" =~ ^[0-9]+$ ]] && valid_classes+=("$ov_val")
+            done < "$OVERRIDES_FILE"
+        fi
+        local count=0 valid=0 f cls size_mb ok
         for f in "$TEMP_DIR"/*.mkv; do
             [[ -f "$f" ]] || continue
             count=$((count + 1))
-            height=$(get_video_height "$f")
             size_mb=$(get_file_size_mb "$f")
-            if [[ -n "$height" && ( "$height" -eq "$TV_HEIGHT" || "$height" -eq "$MOVIES_HEIGHT" ) ]]; then
-                log_ok "$(basename "$f") [${height}p, ${size_mb}MB]"
+            ok=false
+            if probe_video "$f"; then
+                cls=$V_CLASS
+                local vc
+                for vc in "${valid_classes[@]}"; do
+                    [[ "$cls" -eq "$vc" ]] && ok=true
+                done
+            fi
+            if [[ "$ok" == true ]]; then
+                log_ok "$(basename "$f") [$(res_label "$cls"), ${size_mb}MB]"
                 valid=$((valid + 1))
             else
-                log_err "$(basename "$f") [${height:-UNKNOWN}p, ${size_mb}MB]"
+                log_err "$(basename "$f") [${cls:-UNKNOWN}p, ${size_mb}MB]"
             fi
         done
         log "Verified: $valid/$count files valid"
