@@ -19,6 +19,15 @@ SETUP=false
 PLAN_ONLY=false
 MAX_FILES=0
 
+# Circuit breaker state for the whole batch (not per title): consecutive
+# failures, the error signature of the last one, and whether it tripped.
+# Override the trip count with REENCODE_MAX_CONSEC_FAILURES if needed.
+CONSEC_FAIL=0
+CONSEC_SIG=""
+CIRCUIT_TRIPPED=false
+CIRCUIT_MAX="${REENCODE_MAX_CONSEC_FAILURES:-5}"
+LAST_FAIL_SIG=""
+
 # Partial output currently being written; removed if we're interrupted.
 CURRENT_PART=""
 
@@ -136,7 +145,18 @@ setup_encoder() {
         vaapi)
             ENC_PRE=(-vaapi_device "$VAAPI_DEVICE")
             GPU_PRE=(-hwaccel vaapi -hwaccel_device "$VAAPI_DEVICE" -hwaccel_output_format vaapi)
-            ENC_V=(-c:v hevc_vaapi -qp "$QUALITY")
+            # -profile:v main is load-bearing, not cosmetic: without it
+            # ffmpeg picks the profile from the filter output format, so a
+            # 10-bit source used to become Main10 and fail on GPUs that
+            # can decode Main10 but not encode it (Polaris/RX 580).
+            # HDR note: this is NOT a proper HDR->SDR conversion. For SDR
+            # 10-bit sources (most x265 10-bit packs, just used for less
+            # banding) dropping to 8-bit is fine. For true HDR10/Dolby
+            # Vision, there is no tonemapping here, so colours will not
+            # be faithfully converted to SDR -- keep those 4K files, or
+            # run a separate CPU tonemap pass (e.g. libplacebo), which
+            # is out of scope for this VAAPI batch path.
+            ENC_V=(-c:v hevc_vaapi -profile:v main -qp "$QUALITY")
             ENC_NAME=hevc_vaapi ;;
         nvenc)
             ENC_PRE=()
@@ -161,6 +181,51 @@ output_dims() {
     read -r OUT_W OUT_H < <(target_dims "$V_W" "$V_H" "$V_DW" "$TARGET_HEIGHT")
 }
 
+# True if a per-file ffmpeg log shows the ENCODER failing to open, as
+# opposed to the DECODER failing on the source. Only encoder failures
+# match: a decode failure must still fall back to CPU decode.
+is_encoder_failure() {
+    grep -qiE 'no usable encoding entrypoint|error while opening encoder|could not open encoder' "$1"
+}
+
+# One-line error signature for a failed file's log, for the circuit
+# breaker: failures only count as "the same" if this matches.
+failure_signature() {
+    local f="$1" line
+    if grep -qi 'no usable encoding entrypoint' "$f"; then
+        echo "vaapi-no-encoding-entrypoint"
+    elif grep -qiE 'error while opening encoder|could not open encoder' "$f"; then
+        echo "encoder-open-failed"
+    else
+        line=$(sed 's/\r/\n/g' "$f" 2>/dev/null \
+            | grep -iE 'error|invalid|not supported|unsupported' | grep -v '^frame=' | head -n 1)
+        [[ -n "$line" ]] && echo "other:${line:0:80}" || echo "unknown"
+    fi
+}
+
+# Pre-flight: one 1-second encode with exactly the settings the batch
+# will use (8-bit nv12, HEVC Main on the VAAPI device). If this fails,
+# the batch would fail on every file, so abort before touching any of
+# them. vainfo is only a hint in the error message, not the check itself:
+# its output format varies, and a test encode is what actually proves
+# the encoder opens.
+preflight_vaapi_encode() {
+    if ffmpeg -nostdin -hide_banner -loglevel error -y \
+        "${ENC_PRE[@]}" \
+        -f lavfi -i "testsrc=duration=1:size=1280x720:rate=30" \
+        -vf "format=nv12,hwupload" \
+        "${ENC_V[@]}" \
+        -f null - 2>/dev/null; then
+        return 0
+    fi
+    log_err "Pre-flight check FAILED: hevc_vaapi (HEVC Main, 8-bit) cannot encode on '$VAAPI_DEVICE'."
+    log_err "  This batch would fail on every file. Check 'vainfo --display drm --device $VAAPI_DEVICE':"
+    log_err "  VAProfileHEVCMain needs a VAEntrypointEncSlice entry. If it only lists VLD, this GPU"
+    log_err "  cannot encode HEVC at all; set ENCODER=software in $CONFIG_PATH instead."
+    log_err "  Aborting before any file is processed."
+    return 1
+}
+
 check_encoder() {
     if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
         log_err "ffmpeg/ffprobe not found in PATH"
@@ -175,6 +240,9 @@ check_encoder() {
     if [[ "$ENCODER" == "vaapi" && ! -e "$VAAPI_DEVICE" ]]; then
         log_err "VAAPI device not found: '${VAAPI_DEVICE}'. Set VAAPI_DEVICE or ENCODER in $CONFIG_PATH"
         exit 1
+    fi
+    if [[ "$ENCODER" == "vaapi" ]]; then
+        preflight_vaapi_encode || exit 1
     fi
 }
 
@@ -292,7 +360,7 @@ encode_file() {
             "${pre[@]}" \
             -i "$input" \
             -map "0:${stream}" -map '0:a?' -map '0:s?' -map '0:t?' \
-            -c copy \
+            -c:a copy -c:s copy -c:t copy \
             -vf "$vf" \
             "${ENC_V[@]}" \
             "${sub_args[@]}" \
@@ -302,7 +370,19 @@ encode_file() {
             ok=true
             break
         fi
-        [[ "$mode" == gpu ]] && log_warn "  GPU decode failed for this file, retrying with CPU decode"
+        if [[ "$mode" == gpu ]]; then
+            # The encoder is identical for GPU and CPU decode, so an
+            # encoder-open failure (e.g. no Main10 entrypoint) will fail
+            # exactly the same way on CPU. Retrying it only wastes a
+            # second full attempt and hides the real error behind a
+            # misleading "GPU decode failed" message. Only retry when
+            # the failure was actually on the decode side.
+            if is_encoder_failure "$logfile"; then
+                log_err "  Encoder failed to open (not a decode problem), not retrying with CPU decode"
+                break
+            fi
+            log_warn "  GPU decode failed for this file, retrying with CPU decode"
+        fi
     done
 
     if [[ "$ok" == true ]]; then
@@ -324,6 +404,7 @@ encode_file() {
         log_ok "Verified: $(basename "$outfile") is ${OUT_W}x${OUT_H}, full length"
         return 0
     else
+        LAST_FAIL_SIG=$(failure_signature "$logfile")
         log_err "FAILED: $filename (see $logfile)"
         # Show the most telling lines from the last attempt.
         awk '/^=== .* decode ===$/ { buf = ""; next } { buf = buf $0 "\n" } END { printf "%s", buf }' "$logfile" 2>/dev/null \
@@ -477,6 +558,7 @@ process_show() {
         case "$rc" in
             0)
                 encoded_files=$((encoded_files + 1))
+                CONSEC_FAIL=0; CONSEC_SIG=""
                 if [[ "$DRY_RUN" != true ]]; then
                     newbase=$(build_newbase "${filename%.*}")
                     outfile="${TEMP_DIR}/${newbase}.mkv"
@@ -485,7 +567,22 @@ process_show() {
                     fi
                 fi ;;
             2) skipped_files=$((skipped_files + 1)) ;;
-            *) failed_files=$((failed_files + 1)) ;;
+            *)
+                failed_files=$((failed_files + 1))
+                # Circuit breaker: a repeated identical failure (e.g. an
+                # unsupported encoder profile) means the rest of the
+                # batch will fail the same way. Stop instead of looping
+                # through hundreds of files. Different errors reset it.
+                if [[ "$LAST_FAIL_SIG" == "$CONSEC_SIG" ]]; then
+                    CONSEC_FAIL=$((CONSEC_FAIL + 1))
+                else
+                    CONSEC_SIG="$LAST_FAIL_SIG"; CONSEC_FAIL=1
+                fi
+                if [[ "$CONSEC_FAIL" -ge "$CIRCUIT_MAX" ]]; then
+                    CIRCUIT_TRIPPED=true
+                    log_err "Circuit breaker: $CONSEC_FAIL consecutive failures with the same error ($CONSEC_SIG), aborting batch."
+                    break
+                fi ;;
         esac
 
         if [[ "$MAX_FILES" -gt 0 && "$total_files" -ge "$MAX_FILES" ]]; then
@@ -558,6 +655,7 @@ process_all() {
     local dir rc=0
     while IFS= read -r -d '' dir; do
         run_show "$dir" || rc=1
+        [[ "$CIRCUIT_TRIPPED" == true ]] && break
     done < <(list_titles)
     return "$rc"
 }
@@ -673,4 +771,8 @@ main() {
     fi
 }
 
-main "$@"
+# Only run when executed directly, not when sourced (e.g. by tests
+# checking is_encoder_failure / failure_signature).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

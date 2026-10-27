@@ -295,7 +295,13 @@ class NoSavingsTest(unittest.TestCase):
 
 
 class VaapiFiltersTest(unittest.TestCase):
-    def test_10bit_uses_p010_and_8bit_uses_nv12(self):
+    def test_10bit_and_8bit_both_use_nv12_and_main_profile(self):
+        """Regression: 10-bit sources must NOT select p010/Main10.
+
+        p010 made hevc_vaapi request VAProfileHEVCMain10, which GPUs like
+        Polaris/RX 580 can decode but not encode (no EncSlice), so every
+        10-bit file failed at encoder open. Output is always 8-bit Main.
+        """
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             run_ffmpeg("-f", "lavfi", "-i", "color=size=1280x720:duration=0.2",
@@ -312,8 +318,32 @@ class VaapiFiltersTest(unittest.TestCase):
                 echo "8bit: $ENC_VF $GPU_VF"
             '''
             out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
-            self.assertIn("10bit: scale=1280:720,format=p010,hwupload scale_vaapi=w=1280:h=720:format=p010", out)
+            self.assertIn("10bit: scale=1280:720,format=nv12,hwupload scale_vaapi=w=1280:h=720:format=nv12", out)
             self.assertIn("8bit: scale=1280:720,format=nv12,hwupload scale_vaapi=w=1280:h=720:format=nv12", out)
+            self.assertNotIn("p010", out)
+
+    def test_encoder_failure_is_not_a_decode_failure(self):
+        """An encoder-open failure must not be retried as a decode failure."""
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "fail.log"
+            log.write_text("[hevc_vaapi] No usable encoding entrypoint found for profile "
+                           "VAProfileHEVCMain10 (18).\n"
+                           "[vost#0:0/hevc_vaapi] Error while opening encoder\n")
+            ok = Path(d) / "ok.log"
+            ok.write_text("Invalid data found when processing input\n")
+            script = f'''
+                source "{ROOT / "common.sh"}"
+                # reencode.sh only runs main when executed directly, so
+                # sourcing it here just loads its functions.
+                source "{ROOT / "reencode.sh"}"
+                is_encoder_failure "{log}" && echo ENCODER_FAIL || echo NOT_ENCODER
+                is_encoder_failure "{ok}" && echo ENCODER_FAIL || echo DECODE_FAIL
+                echo "sig: $(failure_signature "{log}")"
+            '''
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+            self.assertIn("ENCODER_FAIL\n", out)
+            self.assertIn("DECODE_FAIL\n", out)
+            self.assertIn("sig: vaapi-no-encoding-entrypoint", out)
 
 
 class VerifyOnlyTest(unittest.TestCase):
