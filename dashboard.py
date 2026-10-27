@@ -39,7 +39,7 @@ COMMON = ROOT / "common.sh"
 INDEX_HTML = ROOT / "web" / "index.html"
 # State lives next to reencode.conf (set in App.__init__), so a Docker /config
 # volume keeps it.
-PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = None
+PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = QUEUE_FILE = None
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 ENCODERS = ("vaapi", "nvenc", "software")
@@ -68,6 +68,7 @@ def load_config():
         'source "$1"; load_config >/dev/null 2>&1; '
         'printf "%s\\0" "$CONFIG_PATH" "$LOG_DIR" "$TEMP_DIR" '
         '"$ENCODER" "$VAAPI_DEVICE" "$HW_DECODE" "$ENCODE_HOURS" "$OVERRIDES_FILE" '
+        '"$OVERRIDES_4K_FILE" '
         '"$TV_HEIGHT" "$TV_QUALITY" "$TV_KEEP_4K" "$MOVIES_HEIGHT" "$MOVIES_QUALITY" "$MOVIES_KEEP_4K"; '
         'for l in "${LIBRARIES[@]}"; do printf "%s\\0%s\\0" "$l" "$(library_profile "$l")"; done'
     )
@@ -77,7 +78,7 @@ def load_config():
     ).stdout.decode("utf-8", "replace")
     parts = out.split("\0")[:-1]
     keys = ["config_path", "log_dir", "temp_dir", "encoder", "vaapi_device", "hw_decode",
-            "encode_hours", "overrides_file"]
+            "encode_hours", "overrides_file", "overrides_4k_file"]
     prof_keys = ["tv_height", "tv_quality", "tv_keep_4k", "movies_height", "movies_quality",
                  "movies_keep_4k"]
     n = len(keys) + len(prof_keys)
@@ -247,16 +248,26 @@ def group_key(base):
     return s.strip(" ._-").translate(ASCII_LOWER)
 
 
-def plan_files(files, target, keep_4k, skip):
+def plan_files(files, target, keep_4k, skip, profile="tv"):
     """Same rules as plan_title() in common.sh. files: dicts with "name",
-    "height" and "cls". Returns [(action, reason)] in the same order."""
+    "height" and "cls". Returns [(action, reason)] in the same order.
+
+    Movies are one title per folder, so for a movie folder "another version"
+    and "a small version already exists" are judged folder-wide, not just
+    by name group: a 1080p BluRay copy is another version of the 2160p
+    WEB-DL copy in the same folder, even though their names differ beyond
+    the resolution marker. TV shows keep per-episode grouping, so one
+    episode's 4K copy is not kept just because other episodes exist."""
+    is_movies = profile == "movies"
     keys = [group_key(os.path.splitext(f["name"])[0]) for f in files]
     versions, small = collections.Counter(keys), {}
     for f, k in zip(files, keys):
         # Stored height, not class: files already shrunk by height count as done.
         if f["height"] and f["height"] <= target:
             small[k] = res_label(f.get("cls"))
+    small_any = bool(small)
     out, best = [], {}
+    best_any = None
     for i, (f, k) in enumerate(zip(files, keys)):
         h, cls = f["height"], f.get("cls") or 0
         if not h:
@@ -267,16 +278,20 @@ def plan_files(files, target, keep_4k, skip):
             out.append(("skip", "set to never shrink"))
         elif cls >= 1800 and keep_4k == "yes":
             out.append(("keep4k", "keeping 4K"))
-        elif cls >= 1800 and keep_4k == "if-other-version" and versions[k] > 1:
+        elif cls >= 1800 and keep_4k == "if-other-version" and (versions[k] > 1 or (is_movies and len(files) > 1)):
             out.append(("keep4k", "keeping 4K, another version exists"))
-        elif k in small:
-            out.append(("extra", f"a {small[k]} version already exists"))
+        elif k in small or (is_movies and small_any):
+            out.append(("extra", f"a {small[k] if k in small else next(iter(small.values()))} version already exists"))
         else:
             out.append(("encode", f"shrink to {target}p"))
             if k not in best or cls > (files[best[k]].get("cls") or 0):
                 best[k] = i
+            if best_any is None or cls > (files[best_any].get("cls") or 0):
+                best_any = i
     for i, k in enumerate(keys):
         if out[i][0] == "encode" and best[k] != i:
+            out[i] = ("extra", "another version of this is being shrunk")
+        if is_movies and out[i][0] == "encode" and best_any is not None and best_any != i:
             out[i] = ("extra", "another version of this is being shrunk")
     return out
 
@@ -286,9 +301,18 @@ def guess_profile(lib):
     return "movies" if "movie" in name or "film" in name else "tv"
 
 
-def title_settings(cfg, overrides, library, path):
-    """Profile settings for a title, with its per-title override applied
-    (same as apply_profile() in common.sh)."""
+KEEP_4K_OVERRIDES = ("keep", "shrink")
+
+
+def title_settings(cfg, overrides, library, path, keep4k_overrides=None):
+    """Profile settings for a title, with its per-title overrides applied
+    (same as apply_profile() in common.sh).
+
+    A per-title 4K setting beats the profile: "keep" keeps this title's
+    4K files whatever the profile says, "shrink" shrinks them whatever
+    the profile says. Without one, the profile's keep_4k applies. This
+    is what makes a per-title resolution actually take effect on a 4K
+    file: previously the profile's keep rule silently vetoed it."""
     try:
         prof = cfg["library_profiles"][cfg["libraries"].index(library)]
     except (ValueError, IndexError):
@@ -297,9 +321,17 @@ def title_settings(cfg, overrides, library, path):
         prof = guess_profile(library)
     p = cfg["profiles"][prof]
     ov = overrides.get(path, "")
+    ov4k = (keep4k_overrides or {}).get(path, "")
+    if ov4k == "keep":
+        keep_4k = "yes"
+    elif ov4k == "shrink":
+        keep_4k = "no"
+    else:
+        keep_4k = p["keep_4k"]
     return {
         "profile": prof, "height": int(ov) if ov.isdigit() else p["height"],
-        "default_height": p["height"], "quality": p["quality"], "keep_4k": p["keep_4k"],
+        "default_height": p["height"], "quality": p["quality"], "keep_4k": keep_4k,
+        "profile_keep_4k": p["keep_4k"], "keep_4k_override": ov4k,
         "override": ov, "skip": ov == "skip",
     }
 
@@ -318,6 +350,28 @@ def read_overrides(path):
 
 
 def write_overrides(path, overrides):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for title, val in sorted(overrides.items()):
+            f.write(f"{val}\t{title}\n")
+    os.replace(tmp, path)
+
+
+def read_4k_overrides(path):
+    """Per-title 4K settings: lines "<keep|shrink><TAB><title path>"."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                val, _, title = line.rstrip("\n").partition("\t")
+                if title and val in KEEP_4K_OVERRIDES:
+                    out[title] = val
+    except OSError:
+        pass
+    return out
+
+
+def write_4k_overrides(path, overrides):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         for title, val in sorted(overrides.items()):
@@ -555,7 +609,7 @@ class Library:
             if not t["files"]:
                 continue
             ts = self.app.title_settings(t)
-            plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"])
+            plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
             todo = done = unknown = at = 0
             size = todo_size = 0
             todo_secs = 0.0
@@ -582,7 +636,7 @@ class Library:
                 "files": len(t["files"]), "above": todo, "at": done, "unknown": unknown,
                 "size": size, "above_size": todo_size, "above_secs": todo_secs,
                 "status": status, "target": ts["height"], "profile": ts["profile"],
-                "override": ts["override"],
+                "override": ts["override"], "keep_4k_override": ts["keep_4k_override"],
             })
         return out
 
@@ -605,12 +659,13 @@ RE_FAILED = re.compile(r"ERR FAILED: (.*?)(?: \(see|$)")
 
 
 class Job:
-    def __init__(self, title, dry_run):
+    def __init__(self, title, dry_run, allow_failures=False):
         self.id = uuid.uuid4().hex[:10]
         self.path = title["path"]
         self.name = title["name"]
         self.library = title["library"]
         self.dry_run = dry_run
+        self.allow_failures = bool(allow_failures)
         self.status = "queued"
         self.created = now()
         self.started = self.finished = None
@@ -639,6 +694,12 @@ class Job:
         self.todo = {}
         self.total_todo = 0.0
         self.speed_avg = None        # smoothed encode speed (x realtime)
+
+    def log_name(self):
+        """Unique per job, so two titles with the same name (TV vs Movies,
+        or differing only by punctuation) never overwrite each other's log."""
+        safe = self.name.replace(" ", "_").replace("!", "")
+        return f"{self.id}_{safe}.log"
 
     def add_line(self, line):
         self.seq += 1
@@ -695,7 +756,8 @@ class Job:
                 title_eta = left / self.speed_avg
         return {
             "id": self.id, "path": self.path, "name": self.name, "library": self.library,
-            "dry_run": self.dry_run, "status": self.status, "created": self.created,
+            "dry_run": self.dry_run, "allow_failures": self.allow_failures,
+            "status": self.status, "created": self.created,
             "started": self.started, "finished": self.finished, "episode": self.episode,
             "episodes": self.episodes, "file": self.file, "file_pct": pct, "file_eta": eta,
             "fps": self.fps, "speed": self.speed, "replaced": self.replaced,
@@ -714,12 +776,50 @@ class Job:
         return rec
 
 
+def save_queue(jobs, path):
+    """Persist queued (not running) jobs as plain dicts, so a dashboard
+    restart doesn't lose them. The running job is not persisted: its
+    process is gone on restart, and re-running it unasked would be a surprise."""
+    if path is None:
+        return
+    tmp = Path(str(path) + ".tmp")
+    try:
+        tmp.write_text(json.dumps([{
+            "path": j.path, "dry_run": j.dry_run,
+            "allow_failures": j.allow_failures, "created": j.created,
+        } for j in jobs]))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def load_queue(path):
+    """Return saved queued-job dicts, or [] if there is nothing usable."""
+    if path is None:
+        return []
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for q in data if isinstance(data, list) else []:
+        if isinstance(q, dict) and isinstance(q.get("path"), str) and q["path"]:
+            out.append(q)
+    return out
+
+
 class JobRunner:
     def __init__(self, app):
         self.app = app
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.queue = []
+        for q in load_queue(QUEUE_FILE):
+            job = Job({"path": q["path"], "name": os.path.basename(q["path"]),
+                       "library": os.path.dirname(q["path"])},
+                      q.get("dry_run", False), q.get("allow_failures", False))
+            job.created = q.get("created") or job.created
+            self.queue.append(job)
         self.current = None
         self.waiting_external = False
         self.waiting_schedule = False
@@ -730,13 +830,20 @@ class JobRunner:
         threading.Thread(target=self._worker, daemon=True).start()
         threading.Thread(target=self._scheduler, daemon=True).start()
 
-    def enqueue(self, title, dry_run=False):
+    def _save_queue(self):
+        # caller may or may not hold self.lock; queue list itself is only
+        # mutated under it, and a slightly stale snapshot is harmless here.
+        save_queue(list(self.queue), QUEUE_FILE)
+
+    def enqueue(self, title, dry_run=False, allow_failures=False):
         with self.lock:
             for j in self.queue + ([self.current] if self.current else []):
-                if j.path == title["path"] and j.dry_run == dry_run:
+                if j.path == title["path"] and j.dry_run == dry_run \
+                        and j.allow_failures == bool(allow_failures):
                     return j, False
-            job = Job(title, dry_run)
+            job = Job(title, dry_run, allow_failures)
             self.queue.append(job)
+            save_queue(list(self.queue), QUEUE_FILE)
         self.wake.set()
         return job, True
 
@@ -745,6 +852,7 @@ class JobRunner:
             for j in self.queue:
                 if j.id == job_id:
                     self.queue.remove(j)
+                    save_queue(list(self.queue), QUEUE_FILE)
                     j.status, j.finished = "cancelled", now()
                     self._record(j)
                     return True
@@ -802,6 +910,7 @@ class JobRunner:
                 if j.id == job_id:
                     k = max(0, min(len(self.queue) - 1, i + delta))
                     self.queue.insert(k, self.queue.pop(i))
+                    save_queue(list(self.queue), QUEUE_FILE)
                     return True
         return False
 
@@ -863,6 +972,7 @@ class JobRunner:
                     if not self.queue:
                         break
                     job = self.queue.pop(0)
+                    save_queue(list(self.queue), QUEUE_FILE)
                     self.current = job
                 try:
                     self._run(job)
@@ -881,9 +991,10 @@ class JobRunner:
         os.makedirs(cfg["temp_dir"], exist_ok=True)
         os.makedirs(cfg["log_dir"], exist_ok=True)
         progress = os.path.join(cfg["temp_dir"], f".progress-{job.id}")
-        logname = job.name.replace(" ", "_").replace("!", "") + ".log"
+        logname = job.log_name()
         env = dict(os.environ, REENCODE_PROGRESS=progress)
-        cmd = ["bash", str(SCRIPT), "--dir", job.path] + (["--dry-run"] if job.dry_run else [])
+        cmd = ["bash", str(SCRIPT), "--dir", job.path] + (["--dry-run"] if job.dry_run else []) \
+            + (["--allow-failures"] if job.allow_failures else [])
 
         title = self.app.title_detail(job.path)
         if title:
@@ -1009,12 +1120,13 @@ _APP = None
 # ── App / HTTP ─────────────────────────────────────────────────────────────
 
 def set_state_dir(d):
-    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE
+    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE, QUEUE_FILE
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
     PROBE_CACHE = d / ".dashboard_cache.json"
     HISTORY_FILE = d / ".dashboard_history.json"
     PASSWORD_FILE = d / ".dashboard_password"
+    QUEUE_FILE = d / ".dashboard_queue.json"
 
 
 class App:
@@ -1022,6 +1134,7 @@ class App:
         self.password = ""
         self.config = load_config()
         self.overrides = read_overrides(self.config["overrides_file"])
+        self.keep4k_overrides = read_4k_overrides(self.config["overrides_4k_file"])
         set_state_dir(Path(self.config["config_path"]).parent)
         self.library = Library(self)
         self.jobs = JobRunner(self)
@@ -1029,16 +1142,18 @@ class App:
     def reload_config(self):
         self.config = load_config()
         self.overrides = read_overrides(self.config["overrides_file"])
+        self.keep4k_overrides = read_4k_overrides(self.config["overrides_4k_file"])
 
     def title_settings(self, title):
-        return title_settings(self.config, self.overrides, title["library"], title["path"])
+        return title_settings(self.config, self.overrides, title["library"], title["path"],
+                              self.keep4k_overrides)
 
     def title_detail(self, path):
         t = self.library.title(path)
         if not t:
             return None
         ts = self.title_settings(t)
-        plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"])
+        plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
         files = [dict(f, action=a, why=w) for f, (a, w) in zip(t["files"], plan)]
         return dict(t, files=files, settings=ts)
 
@@ -1048,6 +1163,13 @@ class App:
         else:
             self.overrides.pop(path, None)
         write_overrides(self.config["overrides_file"], self.overrides)
+
+    def set_keep4k_override(self, path, value):
+        if value:
+            self.keep4k_overrides[path] = value
+        else:
+            self.keep4k_overrides.pop(path, None)
+        write_4k_overrides(self.config["overrides_4k_file"], self.keep4k_overrides)
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""
@@ -1227,14 +1349,26 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/jobs":
             titles = data.get("paths") or [data.get("path")]
             dry = bool(data.get("dry_run"))
+            allow = bool(data.get("allow_failures"))
             added = 0
             for p in titles:
                 t = app.library.title(p) if isinstance(p, str) else None
                 if not t:
                     return self._send(404, {"error": f"Unknown title: {p}"})
-                _, new = app.jobs.enqueue(t, dry)
+                _, new = app.jobs.enqueue(t, dry, allow)
                 added += new
             return self._send(200, {"added": added})
+        if url.path == "/api/no-savings/clear":
+            # Files that once didn't save space are skipped by reencode.sh
+            # until encoder/quality/target changes (see common.sh), or
+            # until this list is cleared on purpose.
+            try:
+                os.remove(os.path.join(app.config["log_dir"], ".no_savings"))
+                return self._send(200, {"ok": True, "cleared": True})
+            except FileNotFoundError:
+                return self._send(200, {"ok": True, "cleared": False})
+            except OSError as e:
+                return self._send(500, {"error": f"Couldn't clear: {e}"})
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
             ok = app.jobs.cancel(parts[2])
             return self._send(200 if ok else 404, {"ok": ok})
@@ -1249,14 +1383,27 @@ class Handler(BaseHTTPRequestHandler):
             app.library.request_scan()
             return self._send(200, {"ok": True})
         if url.path == "/api/title/override":
-            path, value = data.get("path"), data.get("value", "")
+            path = data.get("path")
             if not isinstance(path, str) or not app.library.title(path) or re.search(r"[\t\n\r]", path):
                 return self._send(404, {"error": "Unknown title"})
-            value = str(value or "").strip().lower()
-            if value not in ("", "skip") and not (value.isdigit() and 144 <= int(value) <= 4320):
-                return self._send(422, {"error": "Use a resolution (e.g. 1080), 'skip', or nothing"})
+            # "value" (resolution/skip) and "keep_4k" are independent: sending
+            # only one must not clear the other.
+            value = keep4k = None
+            if "value" in data:
+                value = str(data.get("value") or "").strip().lower()
+                if value not in ("", "skip") and not (value.isdigit() and 144 <= int(value) <= 4320):
+                    return self._send(422, {"error": "Use a resolution (e.g. 1080), 'skip', or nothing"})
+            if "keep_4k" in data:
+                keep4k = str(data.get("keep_4k") or "").strip().lower()
+                if keep4k not in ("",) + KEEP_4K_OVERRIDES:
+                    return self._send(422, {"error": "Use 'keep', 'shrink', or nothing (use profile)"})
+            if value is None and keep4k is None:
+                return self._send(422, {"error": "Nothing to change"})
             try:
-                app.set_override(path, value)
+                if value is not None:
+                    app.set_override(path, value)
+                if keep4k is not None:
+                    app.set_keep4k_override(path, keep4k)
             except OSError as e:
                 return self._send(500, {"error": f"Couldn't save: {e}"})
             return self._send(200, {"ok": True, "detail": app.title_detail(path)})

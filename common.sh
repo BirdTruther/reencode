@@ -132,6 +132,7 @@ finalize_profiles() {
     MOVIES_QUALITY="${MOVIES_QUALITY:-$QUALITY}"
     MOVIES_KEEP_4K="${MOVIES_KEEP_4K:-if-other-version}"
     OVERRIDES_FILE="$(dirname "$CONFIG_PATH")/title_overrides.tsv"
+    OVERRIDES_4K_FILE="$(dirname "$CONFIG_PATH")/title_4k.tsv"
 }
 
 load_config() {
@@ -198,6 +199,38 @@ library_profile() {
     if [[ "$name" == *movie* || "$name" == *film* ]]; then echo movies; else echo tv; fi
 }
 
+# Files that once didn't save space, in LOG_DIR/.no_savings. The key
+# includes encoder, quality and target height, so changing any of those
+# retries a file instead of skipping it forever. Old plain-path entries
+# (recorded before this keying) are deliberately ignored, not matched:
+# they were recorded without those settings and would block forever.
+NO_SAVINGS_LIST() { echo "${LOG_DIR}/.no_savings"; }
+
+NO_SAVINGS_KEY() { printf '%s:%s:%s:%s' "${ENCODER:-}" "${QUALITY:-}" "${TARGET_HEIGHT:-}" "$1"; }
+
+is_no_savings() {
+    [[ -f "$(NO_SAVINGS_LIST)" ]] && grep -Fxq -- "$(NO_SAVINGS_KEY "$1")" "$(NO_SAVINGS_LIST)"
+}
+
+record_no_savings() {
+    local list tmp line key
+    list="$(NO_SAVINGS_LIST)"; tmp="${list}.tmp"; key=$(NO_SAVINGS_KEY "$1")
+    mkdir -p "$(dirname "$list")"
+    : > "$tmp"
+    if [[ -f "$list" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+                "$1"|*":$1") continue ;;
+                *) printf '%s\n' "$line" >> "$tmp" ;;
+            esac
+        done < "$list"
+    fi
+    printf '%s\n' "$key" >> "$tmp"
+    mv -f "$tmp" "$list"
+}
+
+clear_no_savings() { rm -f "$(NO_SAVINGS_LIST)"; }
+
 # Per-title setting from OVERRIDES_FILE (lines: "<height|skip><TAB><title path>").
 title_override() {
     [[ -f "${OVERRIDES_FILE:-}" ]] || return 0
@@ -210,9 +243,21 @@ title_override() {
     done < "$OVERRIDES_FILE"
 }
 
+# Per-title 4K setting from OVERRIDES_4K_FILE (lines: "<keep|shrink><TAB><title path>").
+title_4k_override() {
+    [[ -f "${OVERRIDES_4K_FILE:-}" ]] || return 0
+    local val path
+    while IFS=$'\t' read -r val path; do
+        if [[ "$path" == "${1%/}" ]]; then
+            echo "$val"
+            return 0
+        fi
+    done < "$OVERRIDES_4K_FILE"
+}
+
 # Set TARGET_HEIGHT, QUALITY, KEEP_4K, PROFILE_NAME and TITLE_SKIP for a title folder.
 apply_profile() {
-    local dir="${1%/}" ov
+    local dir="${1%/}" ov ov4k
     PROFILE_NAME=$(library_profile "$(dirname "$dir")")
     if [[ "$PROFILE_NAME" == movies ]]; then
         TARGET_HEIGHT=$MOVIES_HEIGHT; QUALITY=$MOVIES_QUALITY; KEEP_4K=$MOVIES_KEEP_4K
@@ -224,6 +269,13 @@ apply_profile() {
     case "$ov" in
         skip) TITLE_SKIP=true ;;
         [0-9]*) TARGET_HEIGHT=$ov ;;
+    esac
+    # A per-title 4K setting beats the profile, so a per-title resolution
+    # actually takes effect on a 4K file instead of being vetoed by it.
+    ov4k=$(title_4k_override "$dir")
+    case "$ov4k" in
+        keep) KEEP_4K=yes ;;
+        shrink) KEEP_4K=no ;;
     esac
 }
 
@@ -239,6 +291,37 @@ group_key() {
 
 get_video_height() {
     probe_video "$1" && echo "$V_H"
+}
+
+get_pix_fmt() {
+    ffprobe -v error -select_streams "${2:-v:0}" -show_entries stream=pix_fmt -of csv=p=0 "$1" 2>/dev/null | head -1
+}
+
+# Scale filters for one file's output size: ENC_VF (CPU decode) and GPU_VF
+# (GPU decode + scale; empty when there's no GPU path).
+# VAAPI: 10-bit+ sources use p010, not nv12. Forcing nv12 downconverted
+# HDR10 files to 8-bit and lost HDR bit depth; p010 keeps 10-bit.
+# $3 = source file, $4 = main stream index (both optional; without them
+# the old nv12 behaviour is kept, so old callers still work).
+set_filters() {
+    local ow="$1" oh="$2" fmt="nv12" pix=""
+    if [[ -n "${3:-}" ]]; then
+        pix=$(get_pix_fmt "$3" "${4:-v:0}")
+        case "$pix" in
+            *10*|*12*|*16*) fmt="p010" ;;
+        esac
+    fi
+    case "$ENCODER" in
+        vaapi)
+            ENC_VF="scale=${ow}:${oh},format=${fmt},hwupload"
+            GPU_VF="scale_vaapi=w=${ow}:h=${oh}:format=${fmt}" ;;
+        nvenc)
+            ENC_VF="scale=${ow}:${oh}"
+            GPU_VF="scale_cuda=${ow}:${oh}" ;;
+        *)
+            ENC_VF="scale=${ow}:${oh}"
+            GPU_VF="" ;;
+    esac
 }
 
 # Find a file's main video stream: the largest one that isn't cover art. (The
@@ -300,7 +383,8 @@ res_label() {
 # Keep the rules in sync with plan_files() in dashboard.py.
 declare -gA PLAN=() WHY=() HEIGHTS=() CLASSES=() STREAMS=() WIDTHS=() DWIDTHS=()
 plan_title() {
-    local f h cls key c
+    local f h cls key c is_movies=false small_any="" best_any="" best_any_h=0 small_label=""
+    [[ "${PROFILE_NAME:-}" == movies ]] && is_movies=true
     local -A key_of=() versions=() small=() best_of=() best_h=()
     PLAN=(); WHY=(); HEIGHTS=(); CLASSES=(); STREAMS=(); WIDTHS=(); DWIDTHS=()
     for f in "$@"; do
@@ -319,6 +403,7 @@ plan_title() {
         # (e.g. 1728x720) count as done and are never shrunk again.
         if [[ -n "$h" ]] && [ "$h" -le "$TARGET_HEIGHT" ]; then
             small["$key"]=$(res_label "${CLASSES["$f"]}")
+            [[ -z "$small_any" ]] && small_any=$(res_label "${CLASSES["$f"]}")
         fi
     done
     for f in "$@"; do
@@ -334,22 +419,34 @@ plan_title() {
             PLAN["$f"]=skip; WHY["$f"]="set to never shrink"
         elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == yes ]]; then
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K"
-        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == if-other-version ]] && [ "$c" -gt 1 ]; then
+        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == if-other-version ]] && { [ "$c" -gt 1 ] || { [[ "$is_movies" == true ]] && [ "$#" -gt 1 ]; }; }; then
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K, another version exists"
-        elif [[ -n "${small["$key"]:-}" ]]; then
-            PLAN["$f"]=extra; WHY["$f"]="a ${small["$key"]} version already exists"
+        elif [[ -n "${small["$key"]:-}" ]] || { [[ "$is_movies" == true ]] && [[ -n "$small_any" ]]; }; then
+            # Movies are one title per folder, so a small version anywhere in
+            # the folder counts, even if its name differs beyond resolution
+            # (e.g. 2160p WEB-DL vs 1080p BluRay). TV keeps per-episode grouping.
+            small_label="${small["$key"]:-$small_any}"
+            PLAN["$f"]=extra; WHY["$f"]="a ${small_label} version already exists"
         else
             PLAN["$f"]=encode; WHY["$f"]="shrink to ${TARGET_HEIGHT}p"
             if [[ -z "${best_of["$key"]:-}" ]] || [ "$cls" -gt "${best_h["$key"]}" ]; then
                 best_of["$key"]=$f
                 best_h["$key"]=$cls
             fi
+            if [[ -z "$best_any" ]] || [ "$cls" -gt "$best_any_h" ]; then
+                best_any=$f; best_any_h=$cls
+            fi
         fi
     done
     # Only the best version of each video is shrunk, so versions can't collide.
+    # For movies, only the best version in the whole folder is shrunk, for
+    # the same reason: differently-named copies would map to one output name.
     for f in "$@"; do
         key=${key_of["$f"]}
         if [[ "${PLAN["$f"]}" == encode && "${best_of["$key"]}" != "$f" ]]; then
+            PLAN["$f"]=extra; WHY["$f"]="another version of this is being shrunk"
+        fi
+        if [[ "$is_movies" == true && "${PLAN["$f"]}" == encode && "$best_any" != "$f" ]]; then
             PLAN["$f"]=extra; WHY["$f"]="another version of this is being shrunk"
         fi
     done
