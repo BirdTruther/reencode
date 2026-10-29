@@ -243,7 +243,7 @@ title_override() {
     done < "$OVERRIDES_FILE"
 }
 
-# Per-title 4K setting from OVERRIDES_4K_FILE (lines: "<keep|shrink><TAB><title path>").
+# Per-title 4K setting from OVERRIDES_4K_FILE (lines: "<keep|shrink|copy><TAB><title path>").
 title_4k_override() {
     [[ -f "${OVERRIDES_4K_FILE:-}" ]] || return 0
     local val path
@@ -276,6 +276,7 @@ apply_profile() {
     case "$ov4k" in
         keep) KEEP_4K=yes ;;
         shrink) KEEP_4K=no ;;
+        copy) KEEP_4K=copy ;;
     esac
 }
 
@@ -421,6 +422,19 @@ plan_title() {
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K"
         elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == if-other-version ]] && { [ "$c" -gt 1 ] || { [[ "$is_movies" == true ]] && [ "$#" -gt 1 ]; }; }; then
             PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K, another version exists"
+        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == copy ]] && { [ "$c" -gt 1 ] || { [[ "$is_movies" == true ]] && [ "$#" -gt 1 ]; }; }; then
+            PLAN["$f"]=keep4k; WHY["$f"]="keeping 4K, another version exists"
+        elif [ "$cls" -ge 1800 ] && [[ "$KEEP_4K" == copy ]]; then
+            # Keep the 4K original and make a smaller companion copy next to
+            # it (placed by place_copy(), the original is never deleted).
+            PLAN["$f"]=makecopy; WHY["$f"]="keep 4K, make ${TARGET_HEIGHT}p copy"
+            if [[ -z "${best_of["$key"]:-}" ]] || [ "$cls" -gt "${best_h["$key"]}" ]; then
+                best_of["$key"]=$f
+                best_h["$key"]=$cls
+            fi
+            if [[ -z "$best_any" ]] || [ "$cls" -gt "$best_any_h" ]; then
+                best_any=$f; best_any_h=$cls
+            fi
         elif [[ -n "${small["$key"]:-}" ]] || { [[ "$is_movies" == true ]] && [[ -n "$small_any" ]]; }; then
             # Movies are one title per folder, so a small version anywhere in
             # the folder counts, even if its name differs beyond resolution
@@ -438,15 +452,16 @@ plan_title() {
             fi
         fi
     done
-    # Only the best version of each video is shrunk, so versions can't collide.
-    # For movies, only the best version in the whole folder is shrunk, for
-    # the same reason: differently-named copies would map to one output name.
+    # Only the best version of each video is shrunk (or copied), so versions
+    # can't collide. For movies, only the best version in the whole folder is
+    # shrunk, for the same reason: differently-named copies would map to one
+    # output name.
     for f in "$@"; do
         key=${key_of["$f"]}
-        if [[ "${PLAN["$f"]}" == encode && "${best_of["$key"]}" != "$f" ]]; then
+        if [[ ( "${PLAN["$f"]}" == encode || "${PLAN["$f"]}" == makecopy ) && "${best_of["$key"]}" != "$f" ]]; then
             PLAN["$f"]=extra; WHY["$f"]="another version of this is being shrunk"
         fi
-        if [[ "$is_movies" == true && "${PLAN["$f"]}" == encode && "$best_any" != "$f" ]]; then
+        if [[ "$is_movies" == true && ( "${PLAN["$f"]}" == encode || "${PLAN["$f"]}" == makecopy ) && "$best_any" != "$f" ]]; then
             PLAN["$f"]=extra; WHY["$f"]="another version of this is being shrunk"
         fi
     done

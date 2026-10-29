@@ -44,7 +44,7 @@ PROBE_CACHE = HISTORY_FILE = PASSWORD_FILE = QUEUE_FILE = None
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 ENCODERS = ("vaapi", "nvenc", "software")
 HW_DECODE_MODES = ("auto", "no")
-KEEP_4K_MODES = ("no", "if-other-version", "yes")
+KEEP_4K_MODES = ("no", "if-other-version", "yes", "copy")
 PROFILES = ("tv", "movies")
 HOURS_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 AUTH_MAX_FAILS = 10       # wrong passwords per IP ...
@@ -322,6 +322,14 @@ def plan_files(files, target, keep_4k, skip, profile="tv"):
             out.append(("keep4k", "keeping 4K"))
         elif cls >= 1800 and keep_4k == "if-other-version" and (versions[k] > 1 or (is_movies and len(files) > 1)):
             out.append(("keep4k", "keeping 4K, another version exists"))
+        elif cls >= 1800 and keep_4k == "copy" and (versions[k] > 1 or (is_movies and len(files) > 1)):
+            out.append(("keep4k", "keeping 4K, another version exists"))
+        elif cls >= 1800 and keep_4k == "copy":
+            out.append(("makecopy", f"keep 4K, make {target}p copy"))
+            if k not in best or cls > (files[best[k]].get("cls") or 0):
+                best[k] = i
+            if best_any is None or cls > (files[best_any].get("cls") or 0):
+                best_any = i
         elif k in small or (is_movies and small_any):
             out.append(("extra", f"a {small[k] if k in small else next(iter(small.values()))} version already exists"))
         else:
@@ -331,9 +339,9 @@ def plan_files(files, target, keep_4k, skip, profile="tv"):
             if best_any is None or cls > (files[best_any].get("cls") or 0):
                 best_any = i
     for i, k in enumerate(keys):
-        if out[i][0] == "encode" and best[k] != i:
+        if out[i][0] in ("encode", "makecopy") and best[k] != i:
             out[i] = ("extra", "another version of this is being shrunk")
-        if is_movies and out[i][0] == "encode" and best_any is not None and best_any != i:
+        if is_movies and out[i][0] in ("encode", "makecopy") and best_any is not None and best_any != i:
             out[i] = ("extra", "another version of this is being shrunk")
     return out
 
@@ -343,7 +351,7 @@ def guess_profile(lib):
     return "movies" if "movie" in name or "film" in name else "tv"
 
 
-KEEP_4K_OVERRIDES = ("keep", "shrink")
+KEEP_4K_OVERRIDES = ("keep", "shrink", "copy")
 
 
 def title_settings(cfg, overrides, library, path, keep4k_overrides=None):
@@ -368,6 +376,8 @@ def title_settings(cfg, overrides, library, path, keep4k_overrides=None):
         keep_4k = "yes"
     elif ov4k == "shrink":
         keep_4k = "no"
+    elif ov4k == "copy":
+        keep_4k = "copy"
     else:
         keep_4k = p["keep_4k"]
     return {
@@ -400,7 +410,7 @@ def write_overrides(path, overrides):
 
 
 def read_4k_overrides(path):
-    """Per-title 4K settings: lines "<keep|shrink><TAB><title path>"."""
+    """Per-title 4K settings: lines "<keep|shrink|copy><TAB><title path>"."""
     out = {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -657,7 +667,7 @@ class Library:
             todo_secs = 0.0
             for f, (action, _) in zip(t["files"], plan):
                 size += f["size"]
-                if action == "encode":
+                if action in ("encode", "makecopy"):
                     todo += 1
                     todo_size += f["size"]
                     todo_secs += f["duration"] or 0
@@ -1041,7 +1051,7 @@ class JobRunner:
         title = self.app.title_detail(job.path)
         if title:
             job.todo = {os.path.basename(f["rel"]): f["duration"] or 0.0
-                        for f in title["files"] if f["action"] == "encode"}
+                        for f in title["files"] if f["action"] in ("encode", "makecopy")}
             job.total_todo = sum(job.todo.values())
 
         job.proc = subprocess.Popen(

@@ -272,6 +272,93 @@ ENCODER="software"
             "Suffix (2020) 1080p BluRay.mkv": "encode"})
 
 
+class Keep4KCopyTest(unittest.TestCase):
+    """Per-title "copy" 4K mode: keep the 4K original and make a smaller
+    companion copy next to it, in both planners and end to end."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        base = Path(cls.tmp.name)
+        make_video(base / "Movies" / "CopySolo (2024)" / "CopySolo (2024) 2160p.mkv", 2160)
+        make_video(base / "Movies" / "CopyPair (2023)" / "CopyPair (2023) 2160p.mkv", 2160)
+        make_video(base / "Movies" / "CopyPair (2023)" / "CopyPair (2023) 1080p.mkv", 1080)
+        make_video(base / "Movies" / "CopyE2E (2025)" / "CopyE2E (2025) 2160p.mkv", 2160)
+        (base / "Movies" / "CopyE2E (2025)" / "CopyE2E (2025) 2160p.srt").write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\ntest\n")
+        cls.base = base
+        (base / "title_4k.tsv").write_text(
+            f"copy\t{base}/Movies/CopySolo (2024)\n"
+            f"copy\t{base}/Movies/CopyPair (2023)\n"
+            f"copy\t{base}/Movies/CopyE2E (2025)\n")
+        cls.conf = base / "reencode.conf"
+        cls.conf.write_text(f"""LIBRARIES=("{base}/Movies")
+LIBRARY_PROFILES=("movies")
+LOG_DIR="{base}/logs"
+TEMP_DIR="{base}/tmp"
+MOVIES_HEIGHT=720
+MOVIES_QUALITY=28
+MOVIES_KEEP_4K="if-other-version"
+ENCODER="software"
+""")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _cfg(self):
+        os.environ["REENCODE_CONFIG"] = str(self.conf)
+        cfg = dashboard.load_config()
+        return cfg, dashboard.read_overrides(cfg["overrides_file"]), \
+            dashboard.read_4k_overrides(cfg["overrides_4k_file"])
+
+    def _bash_plan(self, title_dir):
+        env = dict(os.environ, REENCODE_CONFIG=str(self.conf))
+        out = subprocess.run(["bash", str(ROOT / "reencode.sh"), "--plan", "--dir", str(title_dir)],
+                             capture_output=True, text=True, check=True, env=env).stdout
+        return {line.split("\t")[3]: line.split("\t")[0] for line in out.splitlines() if line.count("\t") == 3}
+
+    def _python_plan(self, title_dir):
+        cfg, overrides, keep4k = self._cfg()
+        files = []
+        for p in sorted(title_dir.rglob("*")):
+            if p.suffix in (".mkv", ".mp4"):
+                info = dashboard.ffprobe(str(p))
+                files.append({"name": p.name, "path": str(p), "height": info["height"], "cls": info["cls"]})
+        ts = dashboard.title_settings(cfg, overrides, str(self.base / "Movies"), str(title_dir), keep4k)
+        plan = dashboard.plan_files(files, ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
+        return {f["path"]: a for f, (a, _) in zip(files, plan)}
+
+    def _check(self, title, expected):
+        d = self.base / "Movies" / title
+        want = {str(d / n): a for n, a in expected.items()}
+        self.assertEqual(self._bash_plan(d), want)
+        self.assertEqual(self._python_plan(d), want)
+
+    def test_solo_4k_plans_makecopy(self):
+        self._check("CopySolo (2024)", {"CopySolo (2024) 2160p.mkv": "makecopy"})
+
+    def test_pair_with_smaller_copy_keeps_4k(self):
+        self._check("CopyPair (2023)", {
+            "CopyPair (2023) 2160p.mkv": "keep4k",
+            "CopyPair (2023) 1080p.mkv": "encode"})
+
+    def test_end_to_end_copy_keeps_original(self):
+        """Full run: the 4K original survives, a 720p copy lands next to it."""
+        d = self.base / "Movies" / "CopyE2E (2025)"
+        src = d / "CopyE2E (2025) 2160p.mkv"
+        env = dict(os.environ, REENCODE_CONFIG=str(self.conf))
+        subprocess.run(["bash", str(ROOT / "reencode.sh"), "--dir", str(d)],
+                       env=env, capture_output=True, check=True)
+        out = d / "CopyE2E (2025) 720p.mkv"
+        self.assertTrue(src.exists(), "original 4K must be kept")
+        self.assertTrue(out.exists(), "720p copy must be created")
+        info = dashboard.ffprobe(str(out))
+        self.assertEqual((info["width"], info["height"], info["codec"]), (1280, 720, "hevc"))
+        self.assertEqual((d / "CopyE2E (2025) 720p.srt").read_text(),
+                         (d / "CopyE2E (2025) 2160p.srt").read_text())
+
+
 class NoSavingsTest(unittest.TestCase):
     def test_keyed_by_settings_and_old_plain_entries_ignored(self):
         with tempfile.TemporaryDirectory() as d:
