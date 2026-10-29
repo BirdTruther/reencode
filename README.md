@@ -115,11 +115,11 @@ Resolution is judged the way Plex shows it: widescreen films count by their widt
 
 When a folder has several versions of the same video, only one of them is ever shrunk, so they can't overwrite each other. If a small enough version already exists, the others are left as they are.
 
-**Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer. VAAPI keeps 10-bit sources at 10-bit (p010) instead of downconverting HDR files to 8-bit.
+**Which GPUs work?** AMD Radeon RX 400 series and newer, Intel 6th generation (Skylake) and newer, and NVIDIA GTX 950 and newer. VAAPI always encodes 8-bit HEVC Main: 10-bit sources are converted to 8-bit (nv12), because some GPUs (e.g. AMD Polaris / RX 580) can decode 10-bit HEVC but not encode it.
 
 ## Security
 
-- **A password is on by default.** One is generated on first run, printed in the logs, and saved as `.dashboard_password` in the config folder. To choose your own, set `REENCODE_DASHBOARD_PASSWORD`.
+- **A password is on by default.** One is generated on first run, printed in the logs, and saved as `.dashboard_password` in the config folder. To choose your own, set `REENCODE_DASHBOARD_PASSWORD`. You get a normal login page in the browser (no browser popup), so password managers can fill it; the login lasts 30 days per browser.
 - **Wrong guesses are blocked.** After 10 wrong passwords, that address is locked out for 10 minutes.
 - **Reaching it from outside your home:** don't just open port 8686 on your router. Use a VPN like [Tailscale](https://tailscale.com), or a reverse proxy with HTTPS (Cosmos, Caddy, Nginx Proxy Manager, …).
 - **Proxy with its own login:** if you've turned that on and removed the port mapping, you can set `REENCODE_DASHBOARD_NO_PASSWORD=1` to avoid logging in twice.

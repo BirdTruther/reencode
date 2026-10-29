@@ -49,6 +49,48 @@ PROFILES = ("tv", "movies")
 HOURS_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 AUTH_MAX_FAILS = 10       # wrong passwords per IP ...
 AUTH_WINDOW = 10 * 60     # ... within this many seconds before we stop answering
+SESSION_TTL = 30 * 24 * 3600  # login cookie lifetime
+SESSION_COOKIE = "reencode_session"
+
+# Login page: a plain HTML form (not the browser's HTTP Basic popup) so
+# password managers can see it, fill it and submit it. Kept deliberately
+# simple: this dashboard is meant for a local network, not the web.
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in &mdash; Reencode</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #14161c; color: #e8eaf0; font: 15px/1.5 system-ui, sans-serif;
+         display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; }
+  form { background: #1d2029; border: 1px solid #2c313d; border-radius: 12px;
+         padding: 28px; width: min(340px, 90vw); }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { color: #9aa0b0; margin: 0 0 8px; font-size: 13px; }
+  p.err { color: #ff7a7a; font-size: 13px; margin: 8px 0 0; }
+  label { display: block; font-size: 13px; color: #9aa0b0; margin: 12px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 15px;
+          background: #14161c; color: #e8eaf0; border: 1px solid #2c313d; border-radius: 8px; }
+  button { width: 100%; margin-top: 18px; padding: 10px; font-size: 15px; font-weight: 600;
+           background: #4c8dff; color: #fff; border: 0; border-radius: 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <form method="post" action="/login">
+    <h1>Reencode</h1>
+    <p class="sub">Log in to the dashboard</p>
+    <!--ERR-->
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" placeholder="anything">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Log in</button>
+  </form>
+</body>
+</html>
+"""
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Characters that would break out of a double-quoted value in reencode.conf.
 UNSAFE_PATH = re.compile(r'["$`\\\x00-\x1f]')
@@ -1205,6 +1247,7 @@ class App:
                     "last": lib.last_scan}
         return {
             "config": cfg,
+            "auth_required": bool(self.password),
             "scan": scan,
             "titles": titles,
             "stats": {
@@ -1251,18 +1294,50 @@ class Handler(BaseHTTPRequestHandler):
 
     fails = {}
     fails_lock = threading.Lock()
+    sessions = {}
+    sessions_lock = threading.Lock()
 
-    def _authed(self):
-        pw = self.app.password
-        if not pw:
-            return True
+    def _rate_limited(self):
+        """True (after sending 429) if this IP burned through its password guesses."""
         ip = self.client_address[0]
         with self.fails_lock:
             recent = [t for t in self.fails.get(ip, []) if t > now() - AUTH_WINDOW]
             self.fails[ip] = recent
         if len(recent) >= AUTH_MAX_FAILS:
             self._send(429, {"error": "Too many wrong passwords. Try again in a few minutes."})
+            return True
+        return False
+
+    def _record_fail(self):
+        with self.fails_lock:
+            self.fails.setdefault(self.client_address[0], []).append(now())
+        time.sleep(0.5)
+
+    def _session_token(self):
+        m = re.search(r"(?:^|;\s*)" + SESSION_COOKIE + r"=([A-Za-z0-9_-]{20,})",
+                      self.headers.get("Cookie", ""))
+        return m.group(1) if m else None
+
+    def _session_valid(self):
+        tok = self._session_token()
+        if not tok:
             return False
+        with self.sessions_lock:
+            exp = self.sessions.get(tok)
+            if exp and exp > now():
+                return True
+            self.sessions.pop(tok, None)
+        return False
+
+    def _authed(self):
+        pw = self.app.password
+        if not pw:
+            return True
+        if self._session_valid():
+            return True
+        # Proactive Basic credentials (curl -u etc.) still work, but the
+        # server never issues a Basic challenge, so browsers never show
+        # their native login popup.
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
             try:
@@ -1271,14 +1346,67 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             except ValueError:
                 pass
-            with self.fails_lock:
-                self.fails.setdefault(ip, []).append(now())
-            time.sleep(0.5)
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="reencode"')
+            self._record_fail()
+        return False
+
+    def _deny(self):
+        # No WWW-Authenticate header anywhere: the browser must never pop
+        # up its own login dialog. API callers get JSON; page loads get
+        # the login form (a real <form>, so password managers can fill it).
+        if urlparse(self.path).path.startswith("/api/"):
+            return self._send(401, {"error": "Login required"})
+        return self._send_login_page()
+
+    def _redirect(self, path):
+        self.send_response(303)
+        self.send_header("Location", path)
         self.send_header("Content-Length", "0")
         self.end_headers()
-        return False
+
+    def _send_login_page(self, error="", status=200):
+        err = f'<p class="err">{error}</p>' if error else ""
+        return self._send(status, LOGIN_PAGE.replace("<!--ERR-->", err).encode("utf-8"),
+                          "text/html; charset=utf-8")
+
+    def _form_body(self):
+        if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/x-www-form-urlencoded":
+            return None
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 10_000:
+            return None
+        return {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
+
+    def _do_login(self):
+        if self._rate_limited():
+            return
+        if self._authed():
+            return self._redirect("/")
+        data = self._form_body()
+        pw = (data or {}).get("password", "")
+        if pw and hmac.compare_digest(pw.encode(), self.app.password.encode()):
+            tok = secrets.token_urlsafe(32)
+            with self.sessions_lock:
+                self.sessions[tok] = now() + SESSION_TTL
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie",
+                             f"{SESSION_COOKIE}={tok}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self._record_fail()
+        self._send_login_page("Wrong password.", status=401)
+
+    def _do_logout(self):
+        tok = self._session_token()
+        if tok:
+            with self.sessions_lock:
+                self.sessions.pop(tok, None)
+        self.send_response(303)
+        self.send_header("Location", "/login")
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _json_body(self):
         # Requiring a JSON content type plus a same-origin check stops other
@@ -1303,9 +1431,17 @@ class Handler(BaseHTTPRequestHandler):
         return data if isinstance(data, dict) else None
 
     def do_GET(self):
-        if not self._authed():
-            return
         url = urlparse(self.path)
+        if url.path == "/login":
+            if self.app.password and self._authed():
+                return self._redirect("/")
+            return self._send_login_page()
+        if url.path == "/logout":
+            return self._do_logout()
+        if self._rate_limited():
+            return
+        if not self._authed():
+            return self._deny()
         q = parse_qs(url.query)
         parts = url.path.strip("/").split("/")
         app = self.app
@@ -1337,12 +1473,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "Not found"})
 
     def do_POST(self):
-        if not self._authed():
+        url = urlparse(self.path)
+        if url.path == "/login":
+            return self._do_login()
+        if self._rate_limited():
             return
+        if not self._authed():
+            return self._deny()
         data = self._json_body()
         if data is None:
             return self._send(400, {"error": "Bad request"})
-        url = urlparse(self.path)
         parts = url.path.strip("/").split("/")
         app = self.app
 
