@@ -287,14 +287,17 @@ encode_file() {
     original_size_mb=$(get_file_size_mb "$input")
 
     height=${HEIGHTS["$input"]:-}
-    if [[ "${PLAN["$input"]:-}" != encode ]]; then
+    local action="${PLAN["$input"]:-}"
+    if [[ "$action" != encode && "$action" != makecopy ]]; then
         local res="?"
         [[ -n "$height" ]] && res="$(res_label "${CLASSES["$input"]}") ${WIDTHS["$input"]}x${height}"
         log_warn "SKIP (${WHY["$input"]:-nothing to do}): $filename [${res}, ${original_size_mb}MB]"
         return 2
     fi
 
-    if is_no_savings "$input"; then
+    # The no-savings list is about shrinking in place; a companion copy is
+    # additive, so it doesn't apply to makecopy.
+    if [[ "$action" == encode ]] && is_no_savings "$input"; then
         log_warn "SKIP (re-encoding didn't save space last time): $filename"
         return 2
     fi
@@ -302,8 +305,12 @@ encode_file() {
     codec=$(get_video_codec "$input" "${STREAMS["$input"]:-v:0}")
 
     if [[ "$DRY_RUN" == true ]]; then
-        local target_size_mb=$(( original_size_mb * 60 / 100 ))
-        log "[DRY-RUN] Would encode: $filename [${height}p, ${codec}, ${original_size_mb}MB] -> ~${target_size_mb}MB"
+        if [[ "$action" == makecopy ]]; then
+            log "[DRY-RUN] Would keep 4K and make ${TARGET_HEIGHT}p copy: $filename [${height}p, ${codec}, ${original_size_mb}MB]"
+        else
+            local target_size_mb=$(( original_size_mb * 60 / 100 ))
+            log "[DRY-RUN] Would encode: $filename [${height}p, ${codec}, ${original_size_mb}MB] -> ~${target_size_mb}MB"
+        fi
         return 0
     fi
 
@@ -395,6 +402,11 @@ encode_file() {
         mv -f "$part" "$outfile"
         CURRENT_PART=""
 
+        if [[ "$action" == makecopy ]]; then
+            place_copy "$input" "$outfile" || return 1
+            return 0
+        fi
+
         local elapsed new_size_mb savings=0
         elapsed=$(( $(date +%s) - start_time ))
         new_size_mb=$(get_file_size_mb "$outfile")
@@ -430,6 +442,64 @@ rename_sidecars() {
         [[ -e "${dir}/${newbase}${suffix}" ]] && continue
         mv -- "$f" "${dir}/${newbase}${suffix}" && log "  Renamed sidecar: $(basename "$f")"
     done
+}
+
+# Duplicate sidecar files (subtitles, nfo) for a new companion copy, so
+# players still match them to the copy's name. Unlike rename_sidecars,
+# the originals stay where they are.
+copy_sidecars() {
+    local dir="$1" base="$2" newbase="$3" f suffix
+    for f in "${dir}/${base}".*; do
+        [[ -f "$f" ]] || continue
+        suffix="${f#"${dir}/${base}"}"
+        case "${suffix##*.}" in
+            srt|ass|ssa|sub|idx|vtt|sup|nfo|SRT|ASS|SSA|SUB|IDX|VTT|SUP|NFO) ;;
+            *) continue ;;
+        esac
+        [[ -e "${dir}/${newbase}${suffix}" ]] && continue
+        cp -- "$f" "${dir}/${newbase}${suffix}" && log "  Copied sidecar: $(basename "$f")"
+    done
+}
+
+# Put an encoded companion copy next to the original (makecopy): the
+# original is kept, unlike replace_original() which deletes it.
+# $1 = original file, $2 = encoded temp file (already verified).
+place_copy() {
+    local input="$1" outfile="$2"
+    local filename base newbase dir newpath tmpdest
+    filename=$(basename "$input")
+    base="${filename%.*}"
+    newbase=$(build_newbase "$base")
+    dir=$(dirname "$input")
+    newpath="${dir}/${newbase}.mkv"
+
+    if [[ -e "$newpath" ]]; then
+        log_warn "Copy already exists for $filename, keeping original and discarding temp file"
+        rm -f -- "$outfile"
+        return 0
+    fi
+
+    # Copy next to the original first, then rename into place, so an
+    # interrupted run never leaves a half-written file behind.
+    tmpdest="${dir}/.${newbase}.mkv.part"
+    CURRENT_PART="$tmpdest"
+    if ! cp -- "$outfile" "$tmpdest" || [[ $(stat -c%s "$tmpdest") != $(stat -c%s "$outfile") ]]; then
+        log_err "Copy to library failed for $filename (disk full?), original untouched"
+        rm -f "$tmpdest"
+        CURRENT_PART=""
+        return 1
+    fi
+    if ! mv -f -- "$tmpdest" "$newpath"; then
+        log_err "Rename failed for $filename, original untouched"
+        rm -f "$tmpdest"
+        CURRENT_PART=""
+        return 1
+    fi
+    CURRENT_PART=""
+    rm -f -- "$outfile"
+    copy_sidecars "$dir" "$base" "$newbase"
+
+    log_ok "Kept original and added copy: ${filename} + ${newbase}.mkv"
 }
 
 replace_original() {
@@ -518,7 +588,8 @@ print_plan() {
     done
 }
 
-# Returns 1 if any episode failed. Sets SHOW_TODO to the number of files to shrink.
+# Returns 1 if any episode failed. Sets SHOW_TODO to the number of files to
+# shrink or copy.
 process_show() {
     local show_dir="$1"
     local show_name f
@@ -528,7 +599,7 @@ process_show() {
     plan_title "${TITLE_FILES[@]}"
     SHOW_TODO=0
     for f in "${TITLE_FILES[@]}"; do
-        [[ "${PLAN["$f"]}" == encode ]] && SHOW_TODO=$((SHOW_TODO + 1))
+        [[ "${PLAN["$f"]}" == encode || "${PLAN["$f"]}" == makecopy ]] && SHOW_TODO=$((SHOW_TODO + 1))
     done
     if [[ "$SHOW_TODO" -eq 0 ]]; then
         log "Nothing to shrink in: $show_name"
