@@ -216,7 +216,7 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
 .title-set { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 16px 10px 46px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .title-set select { height: 30px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel); padding: 0 8px; }
 .why { font-size: 12px; }
-.why.encode { color: var(--warn); } .why.keep4k { color: var(--info); } .why.extra, .why.skip, .why.unknown { color: var(--muted); } .why.ok { color: var(--ok); }
+.why.encode, .why.makecopy { color: var(--warn); } .why.keep4k { color: var(--info); } .why.extra, .why.skip, .why.unknown { color: var(--muted); } .why.ok { color: var(--ok); }
 
 #toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 50; width: min(420px, calc(100vw - 32px)); }
 .toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.2); animation: tin .2s ease; }
@@ -718,7 +718,7 @@ function renderLibrary() {
 
 // Fingerprint of a title's summary; a cached file list is refetched when it changes.
 const detailFp = t => t ? JSON.stringify([t.above, t.at, t.files, t.size, t.target, t.override, t.keep_4k_override, t.status]) : "";
-const ACTION = { encode: "to shrink", ok: "", keep4k: "kept", extra: "left as is", skip: "never shrink", unknown: "unreadable" };
+const ACTION = { encode: "to shrink", makecopy: "keep 4K, make copy", ok: "", keep4k: "kept", extra: "left as is", skip: "never shrink", unknown: "unreadable" };
 
 function detailHtml(path) {
   const d = detailCache.get(path);
@@ -728,13 +728,13 @@ function detailHtml(path) {
   const def = `Default (${PROFILE_LABEL[st.profile] || "TV"} · ${st.default_height}p)`;
   const opts = [["", def], ...HEIGHTS.map(h => [String(h), h + "p"]), ["skip", "Never shrink"]]
     .map(([v, n]) => `<option value="${v}" ${v === (st.override || "") ? "selected" : ""}>${n}</option>`).join("");
-  const k4kOpts = [["", `Use profile (${KEEP4K[st.profile_keep_4k] || "Shrink them too"})`], ["keep", "Keep 4K"], ["shrink", "Shrink 4K"]]
+  const k4kOpts = [["", `Use profile (${KEEP4K[st.profile_keep_4k] || "Shrink them too"})`], ["keep", "Keep 4K"], ["shrink", "Shrink 4K"], ["copy", `Keep 4K + make ${st.height}p copy`]]
     .map(([v, n]) => `<option value="${v}" ${v === (st.keep_4k_override || "") ? "selected" : ""}>${n}</option>`).join("");
   return `<div class="title-set"><label>Shrink to <select data-act="override" aria-label="Resolution for this title">${opts}</select></label>
       <label>4K files <select data-act="keep4k" aria-label="4K handling for this title">${k4kOpts}</select></label>
       <span class="muted">Only for this title. The ${PROFILE_LABEL[st.profile] || "TV"} profile is used otherwise.</span></div>
     <table class="files">${d.files.map(f => {
-    const cls = !f.height ? "lo" : f.action === "encode" ? "hi" : f.action === "ok" && f.cls === st.height ? "ok" : "lo";
+    const cls = !f.height ? "lo" : (f.action === "encode" || f.action === "makecopy") ? "hi" : f.action === "ok" && f.cls === st.height ? "ok" : "lo";
     return `<tr><td class="mono" style="word-break:break-all">${esc(f.rel)}</td>
       <td class="res ${cls}" title="${f.width && f.height ? f.width + "×" + f.height : ""}">${f.height ? esc(f.res || f.height + "p") : "?"}<span class="faint hide-sm" style="font-weight:400"> ${f.width && f.height ? f.width + "×" + f.height : ""}</span></td>
       <td class="why ${esc(f.action)}" title="${esc(f.why)}">${esc(f.action === "ok" ? f.why : ACTION[f.action] ? ACTION[f.action] + (f.action === "encode" ? "" : ": " + f.why) : f.why)}</td>
@@ -769,7 +769,7 @@ async function setKeep4k(path, value) {
   try {
     await api("/api/title/override", { path, keep_4k: value });
     detailCache.delete(path);
-    toast(value === "keep" ? "This title's 4K files will be kept" : value === "shrink" ? "This title's 4K files will be shrunk" : "Using the profile's 4K setting again");
+    toast(value === "keep" ? "This title's 4K files will be kept" : value === "shrink" ? "This title's 4K files will be shrunk" : value === "copy" ? "This title will keep its 4K files and get a smaller copy" : "Using the profile's 4K setting again");
     await refresh();
   } catch (e) { toast(e.message, true); }
 }
@@ -850,7 +850,7 @@ $("#rescanBtn").addEventListener("click", async () => { detailCache.clear(); awa
 /* ── settings ──────────────────────────────────────────── */
 const QHINT = { vaapi: "Quality is QP: 20 ≈ near-lossless, 28–32 = good & small.", nvenc: "Quality is CQ: try 24–28. Lower = bigger, better.", software: "Quality is CRF: try 24–28. Lower = bigger, better." };
 const HEIGHTS = [480, 540, 576, 720, 1080, 1440];
-const KEEP4K = { "no": "Shrink them too", "if-other-version": "Keep if another version", "yes": "Always keep" };
+const KEEP4K = { "no": "Shrink them too", "if-other-version": "Keep if another version", "yes": "Always keep", "copy": "Keep + make smaller copy" };
 const PROFILE_LABEL = { tv: "TV", movies: "Movies" };
 const heightOpts = sel => HEIGHTS.concat(HEIGHTS.includes(sel) ? [] : [sel]).sort((a, b) => a - b)
   .map(h => `<option value="${h}" ${h === sel ? "selected" : ""}>${h}p</option>`).join("");
