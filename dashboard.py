@@ -876,12 +876,22 @@ class JobRunner:
         self.current = None
         self.waiting_external = False
         self.waiting_schedule = False
+        self.paused = True  # queue Start/Pause: build the queue, then press
+        # Start. While paused, neither the local runner nor workers pick up
+        # new jobs; a running job finishes.
+        self.started_at = time.time()
         try:
             self.history = json.loads(HISTORY_FILE.read_text())
         except (OSError, ValueError):
             self.history = []
         threading.Thread(target=self._worker, daemon=True).start()
         threading.Thread(target=self._scheduler, daemon=True).start()
+
+    def set_paused(self, paused):
+        with self.lock:
+            self.paused = bool(paused)
+        if not paused:
+            self.wake.set()
 
     def _save_queue(self):
         # caller may or may not hold self.lock; queue list itself is only
@@ -901,6 +911,7 @@ class JobRunner:
         return job, True
 
     def cancel(self, job_id):
+        dropped_path = None
         with self.lock:
             for j in self.queue:
                 if j.id == job_id:
@@ -908,13 +919,21 @@ class JobRunner:
                     save_queue(list(self.queue), QUEUE_FILE)
                     j.status, j.finished = "cancelled", now()
                     self._record(j)
+                    dropped_path = j.path
+                    break
+            else:
+                j = self.current
+                if j and j.id == job_id and j.proc:
+                    j.cancel_requested = True
+                    stop_job(j)
                     return True
-            j = self.current
-            if j and j.id == job_id and j.proc:
-                j.cancel_requested = True
-                stop_job(j)
-                return True
-        return False
+                return False
+        # Outside jobs.lock (lock order is worker_lock -> jobs.lock): void
+        # any worker claim on the cancelled title. The worker's next
+        # heartbeat then reports the job gone and it moves on.
+        if dropped_path:
+            self.app.worker_drop_title(dropped_path)
+        return True
 
     def pause(self, job_id, by="user"):
         with self.lock:
@@ -1021,12 +1040,14 @@ class JobRunner:
                     time.sleep(20)
                     continue
                 self.waiting_schedule = False
-                with self.lock:
-                    if not self.queue:
-                        break
-                    job = self.queue.pop(0)
-                    save_queue(list(self.queue), QUEUE_FILE)
-                    self.current = job
+                job = self.app._local_next_title()
+                if job is None:
+                    with self.lock:
+                        empty = not self.queue
+                    if empty:
+                        break  # outer loop waits on wake
+                    time.sleep(10)  # yielded to a worker or paused; recheck
+                    continue
                 try:
                     self._run(job)
                 except Exception as e:
@@ -1116,6 +1137,7 @@ class JobRunner:
                 "history": [{k: v for k, v in h.items() if k != "log_tail"} for h in self.history[:50]],
                 "waiting_external": self.waiting_external,
                 "waiting_schedule": self.waiting_schedule and bool(self.queue),
+                "paused": self.paused,
             }
 
     def last_speed(self):
@@ -1252,26 +1274,31 @@ class App:
         with self.worker_lock:
             return self._load_worker_jobs().get(job_id)
 
-    def _worker_candidates(self):
-        """Files currently planned as encode/makecopy, across all titles.
+    # ---- remote workers (v1) ----
+    # v1 rule: a worker NEVER scans the library. It only encodes files
+    # from titles the user explicitly queued in the dashboard. The queue
+    # (JobRunner) is the single source of work for workers and the local
+    # runner alike.
+    def _worker_actionable(self, title_path):
+        """Files planned as encode/makecopy for one title path.
 
-        Yields (title, file, action, full_path); scanned file dicts carry
-        "rel" (path relative to the title), not an absolute "path"."""
-        out = []
+        Returns [(file_dict, action, full_path)] or None when the title
+        isn't plannable right now. Takes library.lock (innermost lock)."""
         with self.library.lock:
-            titles = list(self.library.titles.values())
-        for t in titles:
-            if not t["files"]:
-                continue
+            t = self.library.titles.get(title_path)
+            if not t or not t["files"]:
+                return None
             ts = self.title_settings(t)
             if ts["skip"]:
-                continue
-            plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
-            for f, (action, _why) in zip(t["files"], plan):
-                if action in ("encode", "makecopy"):
-                    out.append((t, f, action, os.path.join(t["path"], f["rel"])))
-        out.sort(key=lambda x: (x[0]["path"], x[3]))
-        return out
+                return None
+            plan = plan_files(t["files"], ts["height"], ts["keep_4k"],
+                              ts["skip"], ts["profile"])
+            return [(f, action, os.path.join(t["path"], f["rel"]))
+                    for f, (action, _why) in zip(t["files"], plan)
+                    if action in ("encode", "makecopy")]
+
+    def _worker_claimed_files(self, jobs):
+        return {j["file"] for j in jobs.values() if j["status"] == "claimed"}
 
     def _worker_cmd(self, title_dir, path, caps):
         """Build the worker's ffmpeg command via reencode.sh --worker-cmd."""
@@ -1293,7 +1320,11 @@ class App:
         return data if isinstance(data, dict) and "argv" in data else None
 
     def worker_next(self, worker, caps):
-        """Claim the next job for a worker, or None if there's nothing."""
+        """Claim the next file for a worker, or None.
+
+        v1: only files from titles the user queued in the dashboard are
+        eligible -- never a library scan. While the queue is paused,
+        workers get nothing (same as the local runner)."""
         caps = {c.strip().lower() for c in caps if c.strip()}
         now = time.time()
         with self.worker_lock:
@@ -1302,62 +1333,215 @@ class App:
                 if j["status"] == "claimed" and j["lease_expires"] < now:
                     j["status"] = "failed"
                     j["error"] = "lease expired (worker went away)"
-            claimed = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
+            self._save_worker_jobs(jobs)
+            self.workers_seen[worker] = {"caps": sorted(caps), "last_seen": now}
+            with self.jobs.lock:
+                paused = self.jobs.paused
+                queue = [j for j in self.jobs.queue if not j.dry_run]
+            if paused:
+                return None
+            claimed = self._worker_claimed_files(jobs)
             done = {j["file"] for j in jobs.values() if j["status"] == "done"}
             # A file that keeps failing (bad source, worker can't handle
             # it) must not be re-downloaded forever: park it after 3
             # failed attempts so someone can look at it.
             failed_counts = collections.Counter(
                 j["file"] for j in jobs.values() if j["status"] == "failed")
-            for t, f, action, full in self._worker_candidates():
-                if full in claimed or full in done:
+            for qj in queue:
+                actionable = self._worker_actionable(qj.path)
+                if actionable is None:
                     continue
-                if failed_counts[full] >= 3:
+                if not actionable or all(full in done
+                                         for _f, _a, full in actionable):
+                    # Nothing left to do (scan agrees, or every file was
+                    # worker-completed): retire the title like the local
+                    # runner would. Parked (3x-failed) files are NOT a
+                    # reason to retire -- the local runner is their fallback.
+                    self._finish_queued_title(qj, by="worker")
                     continue
-                needs = {"av1d"} if f.get("codec") == "av1" else set()
-                if not needs <= caps:
-                    continue
-                cmd = self._worker_cmd(t["path"], full, caps)
-                if not cmd:
-                    continue
-                jid = uuid.uuid4().hex[:12]
-                token = uuid.uuid4().hex
-                jobs[jid] = {
-                    "id": jid, "title": t["path"], "file": full,
-                    "filename": f["name"], "size": f["size"],
-                    "worker": worker, "caps": sorted(caps), "needs": sorted(needs),
-                    "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
-                    "out_h": cmd["out_h"], "duration": cmd["duration"],
-                    "newbase": cmd["newbase"], "status": "claimed",
-                    "claim_token": token,
-                    "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
-                    "attempts": sum(1 for j in jobs.values()
-                                    if j["file"] == full) + 1,
-                }
-                self._save_worker_jobs(jobs)
-                self.workers_seen[worker] = {"caps": sorted(caps), "last_seen": now}
-                j = jobs[jid]
-                return {"job_id": jid, "claim_token": token,
-                        "filename": j["filename"], "size": j["size"],
-                        "action": action, "argv": j["argv"], "out_w": j["out_w"],
-                        "out_h": j["out_h"], "duration": j["duration"],
-                        "lease_secs": WORKER_LEASE_SECS}
-            self._save_worker_jobs(jobs)
-            self.workers_seen.setdefault(worker, {"caps": sorted(caps), "last_seen": now})
-            self.workers_seen[worker]["last_seen"] = now
+                for f, action, full in actionable:
+                    if full in claimed or full in done:
+                        continue
+                    if failed_counts[full] >= 3:
+                        continue
+                    needs = {"av1d"} if f.get("codec") == "av1" else set()
+                    if not needs <= caps:
+                        continue
+                    cmd = self._worker_cmd(qj.path, full, caps)
+                    if not cmd:
+                        continue
+                    jid = uuid.uuid4().hex[:12]
+                    token = uuid.uuid4().hex
+                    jobs[jid] = {
+                        "id": jid, "title": qj.path, "file": full,
+                        "filename": f["name"], "size": f["size"],
+                        "worker": worker, "caps": sorted(caps), "needs": sorted(needs),
+                        "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
+                        "out_h": cmd["out_h"], "duration": cmd["duration"],
+                        "newbase": cmd["newbase"], "status": "claimed",
+                        "claim_token": token, "progress": None,
+                        "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
+                        "attempts": sum(1 for j in jobs.values()
+                                        if j["file"] == full) + 1,
+                    }
+                    self._save_worker_jobs(jobs)
+                    j = jobs[jid]
+                    return {"job_id": jid, "claim_token": token,
+                            "filename": j["filename"], "size": j["size"],
+                            "action": action, "argv": j["argv"], "out_w": j["out_w"],
+                            "out_h": j["out_h"], "duration": j["duration"],
+                            "lease_secs": WORKER_LEASE_SECS}
             return None
+
+    def _finish_queued_title(self, qj, by="worker"):
+        """Retire a queued title with nothing left to encode.
+
+        Caller holds worker_lock; takes jobs.lock (lock order holds)."""
+        jr = self.jobs
+        with jr.lock:
+            if qj in jr.queue:
+                jr.queue.remove(qj)
+            qj.status = "done"
+            qj.finished = now()
+            qj.add_line("-- no files left to encode "
+                        f"({'worker did them' if by == 'worker' else by}) --")
+            jr._record(qj)
+            save_queue(list(jr.queue), QUEUE_FILE)
+        self.library.request_scan([qj.path])
+
+    def worker_drop_title(self, title_path):
+        """A queued title was cancelled: void its worker claims.
+
+        The worker's next heartbeat then reports the job gone and it
+        moves on. Never called with jobs.lock held (lock order)."""
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            dropped = [jid for jid, j in jobs.items()
+                       if j["title"] == title_path and j["status"] == "claimed"]
+            for jid in dropped:
+                del jobs[jid]
+            if dropped:
+                self._save_worker_jobs(jobs)
+
+    def _local_next_title(self):
+        """Next queued title the LOCAL runner may encode, or None to wait.
+
+        Skips titles with outstanding worker claims (the worker owns them
+        for now), never re-takes files a worker already finished, and
+        yields to an idle worker that could take the title -- it claims on
+        its ~15s poll. Titles with nothing left to encode are retired from
+        the queue. Dry runs are local-only: take at once.
+        Lock order: worker_lock -> jobs.lock -> library.lock."""
+        with self.worker_lock:
+            # After a dashboard restart, give a worker one poll interval
+            # to check in before the local runner grabs queued work --
+            # otherwise the 5s startup pop always beats the 15s worker poll.
+            if not self.workers_seen \
+                    and time.time() - self.jobs.started_at < 20:
+                return None
+            wjobs = self._load_worker_jobs()
+            claimed_files = self._worker_claimed_files(wjobs)
+            done_files = {j["file"] for j in wjobs.values()
+                          if j["status"] == "done"}
+            busy = {j["worker"] for j in wjobs.values()
+                    if j["status"] == "claimed"}
+            failed_counts = collections.Counter(
+                j["file"] for j in wjobs.values() if j["status"] == "failed")
+            now = time.time()
+            idle = [(n, w["caps"]) for n, w in self.workers_seen.items()
+                    if now - w["last_seen"] < 45 and n not in busy]
+            retire, pick, yield_wait = [], None, False
+            with self.jobs.lock:
+                if not self.jobs.paused:
+                    with self.library.lock:
+                        titles = dict(self.library.titles)
+                    for j in list(self.jobs.queue):
+                        if j.dry_run:
+                            pick = j
+                            break
+                        t = titles.get(j.path)
+                        if not t or not t["files"]:
+                            continue
+                        ts = self.title_settings(t)
+                        if ts["skip"]:
+                            continue
+                        plan = plan_files(t["files"], ts["height"], ts["keep_4k"],
+                                          ts["skip"], ts["profile"])
+                        actionable = [(f, a, os.path.join(t["path"], f["rel"]))
+                                      for f, (a, _w) in zip(t["files"], plan)
+                                      if a in ("encode", "makecopy")
+                                      and os.path.join(t["path"], f["rel"])
+                                      not in done_files]
+                        if not actionable:
+                            retire.append(j)
+                            continue
+                        if any(full in claimed_files
+                               for _f, _a, full in actionable):
+                            continue  # a worker owns this title for now
+                        # Files a worker gave up on (3 failures) are the
+                        # local runner's job; only yield for a file an idle
+                        # worker can actually still claim.
+                        takeable = [f for f, _a, full in actionable
+                                    if failed_counts[full] < 3]
+                        if any(({"av1d"} if f.get("codec") == "av1" else set())
+                               <= set(caps)
+                               for f in takeable for _n, caps in idle):
+                            yield_wait = True  # an idle worker claims shortly
+                            break
+                        pick = j
+                        break
+                    if pick is not None:
+                        self._pop_local(pick)
+            # Retire outside jobs.lock (lock order); _finish_queued_title
+            # takes it again itself.
+            for j in retire:
+                self._finish_queued_title(j, by="worker")
+            if yield_wait:
+                return None
+            return pick
+
+    def _pop_local(self, j):
+        """Pop a queued title for local encoding. Caller holds worker_lock
+        and jobs.lock."""
+        self.jobs.queue.remove(j)
+        save_queue(list(self.jobs.queue), QUEUE_FILE)
+        self.jobs.current = j
+        return j
 
     def _worker_claim_ok(self, j, token):
         return bool(j) and j["status"] == "claimed" and \
             j.get("claim_token") == token
 
-    def worker_heartbeat(self, job_id, token):
+    def worker_heartbeat(self, job_id, token, progress=None):
         with self.worker_lock:
             jobs = self._load_worker_jobs()
             j = jobs.get(job_id)
             if not self._worker_claim_ok(j, token):
                 return False
             j["lease_expires"] = time.time() + WORKER_LEASE_SECS
+            if progress is not None:
+                try:
+                    j["progress"] = max(0.0, min(100.0, float(progress)))
+                except (TypeError, ValueError):
+                    pass
+            self._save_worker_jobs(jobs)
+            # A busy worker still counts as connected (for the local
+            # runner's yield decision).
+            w = self.workers_seen.get(j["worker"])
+            if w:
+                w["last_seen"] = time.time()
+            return True
+
+    def worker_release(self, job_id, token):
+        """Ctrl+C / clean shutdown: hand the claim back WITHOUT counting
+        a failure. The file is immediately claimable again (by a worker
+        or the local runner)."""
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            j = jobs.get(job_id)
+            if not self._worker_claim_ok(j, token):
+                return False
+            del jobs[job_id]
             self._save_worker_jobs(jobs)
             return True
 
@@ -1409,17 +1593,28 @@ class App:
                 j["status"] = "failed"
                 j["error"] = str(data.get("error") or "place failed")[:500]
             self._save_worker_jobs(jobs)
-            return {"ok": bool(data.get("ok")), "error": data.get("error")}
+            ok = bool(data.get("ok"))
+            if ok:
+                # Refresh the scan so the next plan sees the replaced file
+                # (request_scan coalesces when a scan is already running).
+                self.library.request_scan([j["title"]])
+            return {"ok": ok, "error": data.get("error")}
 
     def worker_status(self):
         with self.worker_lock:
             jobs = self._load_worker_jobs()
             seen = dict(self.workers_seen)
         now = time.time()
-        claimed_files = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
-        done_files = {j["file"] for j in jobs.values() if j["status"] == "done"}
-        pending = sum(1 for _t, _f, _a, full in self._worker_candidates()
-                      if full not in claimed_files and full not in done_files)
+        # v1: pending counts actionable files in explicitly queued titles.
+        with self.jobs.lock:
+            qpaths = [j.path for j in self.jobs.queue if not j.dry_run]
+        claimed = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
+        done = {j["file"] for j in jobs.values() if j["status"] == "done"}
+        pending = 0
+        for p in qpaths:
+            act = self._worker_actionable(p) or []
+            pending += sum(1 for _f, _a, full in act
+                           if full not in claimed and full not in done)
         recent = sorted(jobs.values(), key=lambda j: j.get("claimed_at", 0), reverse=True)[:15]
         return {
             "workers": [{"name": n, "caps": w["caps"],
@@ -1431,8 +1626,28 @@ class App:
             "failed": sum(1 for j in jobs.values() if j["status"] == "failed"),
             "recent": [{"id": j["id"], "filename": j["filename"], "worker": j["worker"],
                         "action": j["action"], "status": j["status"],
+                        "progress": j.get("progress"),
                         "error": j.get("error", "")} for j in recent],
         }
+
+    def _merge_worker_info(self, jobs_state):
+        """Annotate queued titles with their worker claim (for the UI).
+
+        Called after jobs.state() -- sequential locking, never nested."""
+        with self.worker_lock:
+            wjobs = self._load_worker_jobs()
+        by_title = {}
+        for j in wjobs.values():
+            if j["status"] == "claimed":
+                by_title[j["title"]] = {"worker": j["worker"],
+                                        "progress": j.get("progress"),
+                                        "filename": j["filename"]}
+        for q in jobs_state.get("queue", []):
+            info = by_title.get(q["path"])
+            if info:
+                q["worker_name"] = info["worker"]
+                q["worker_progress"] = info["progress"]
+                q["worker_file"] = info["filename"]
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""
@@ -1460,6 +1675,7 @@ class App:
         cfg = self.config
         titles = self.library.summaries()
         jobs = self.jobs.state()
+        self._merge_worker_info(jobs)
         ratio = self.jobs.size_ratio()
         to_encode = sum(t["above_size"] for t in titles)
         lib = self.library
@@ -1698,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "Not found"})
 
     def _worker_api(self, url):
-        """Remote-worker endpoints (v0). No login: LAN-only by design."""
+        """Remote-worker endpoints (v1). No login: LAN-only by design."""
         q = parse_qs(url.query)
         parts = url.path.strip("/").split("/")
         app = self.app
@@ -1716,13 +1932,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "heartbeat":
             data = self._json_body() or {}
-            ok = app.worker_heartbeat(parts[3], data.get("token", ""))
+            ok = app.worker_heartbeat(parts[3], data.get("token", ""),
+                                      data.get("progress"))
             return self._send(200, {"ok": ok, "lease_secs": WORKER_LEASE_SECS})
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "fail":
             data = self._json_body() or {}
             app.worker_fail(parts[3], str(data.get("error", "")), data.get("token", ""))
             return self._send(200, {"ok": True})
+        if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
+                and parts[2] == "release":
+            # Ctrl+C / clean shutdown: the job goes back in the queue,
+            # NOT counted as a failure.
+            data = self._json_body() or {}
+            ok = app.worker_release(parts[3], data.get("token", ""))
+            return self._send(200, {"ok": ok})
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "result":
             token = (q.get("token") or [""])[0]
@@ -1835,6 +2059,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] in ("up", "down"):
             ok = app.jobs.move(parts[2], -1 if parts[3] == "up" else 1)
             return self._send(200 if ok else 404, {"ok": ok})
+        if url.path == "/api/queue/pause":
+            app.jobs.set_paused(True)
+            return self._send(200, {"ok": True, "paused": True})
+        if url.path == "/api/queue/resume":
+            app.jobs.set_paused(False)
+            return self._send(200, {"ok": True, "paused": False})
         if url.path == "/api/scan":
             app.library.request_scan()
             return self._send(200, {"ok": True})
