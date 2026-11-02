@@ -1339,6 +1339,10 @@ class App:
                 paused = self.jobs.paused
                 queue = [j for j in self.jobs.queue if not j.dry_run]
             if paused:
+                self._worker_idle(worker, "paused")
+                return None
+            if not queue:
+                self._worker_idle(worker, "empty")
                 return None
             claimed = self._worker_claimed_files(jobs)
             done = {j["file"] for j in jobs.values() if j["status"] == "done"}
@@ -1391,7 +1395,15 @@ class App:
                             "action": action, "argv": j["argv"], "out_w": j["out_w"],
                             "out_h": j["out_h"], "duration": j["duration"],
                             "lease_secs": WORKER_LEASE_SECS}
+            self._worker_idle(worker, "nothing")
             return None
+
+    def _worker_idle(self, worker, reason):
+        """Why a worker got no job (shown in its console so waiting isn't
+        a mystery): paused / empty / nothing."""
+        if not hasattr(self, "worker_idle"):
+            self.worker_idle = {}
+        self.worker_idle[worker] = reason
 
     def _finish_queued_title(self, qj, by="worker"):
         """Retire a queued title with nothing left to encode.
@@ -1923,7 +1935,12 @@ class Handler(BaseHTTPRequestHandler):
             caps = [c for c in (q.get("caps") or [""])[0].split(",") if c.strip()]
             job = app.worker_next(worker, caps)
             if not job:
-                return self._send(204, b"")
+                self.send_response(204)
+                self.send_header("X-Idle-Reason",
+                                 getattr(app, "worker_idle", {}).get(worker, ""))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             return self._send(200, job)
         if self.command == "GET" and parts == ["api", "worker", "status"]:
             return self._send(200, app.worker_status())

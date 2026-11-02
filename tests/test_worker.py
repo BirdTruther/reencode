@@ -261,6 +261,7 @@ class WorkerProtocolTest(unittest.TestCase):
         app.jobs.enqueue(dirs["Film"])
         app.jobs.paused = True
         self.assertIsNone(app.worker_next("w1", ["software"]))
+        self.assertEqual(app.worker_idle["w1"], "paused")
         app.jobs.paused = False
         self.assertIsNotNone(app.worker_next("w1", ["software"]))
 
@@ -470,6 +471,79 @@ class WorkerProtocolTest(unittest.TestCase):
             job = app.worker_next("gpu", ["nvenc", "cuda", "av1d"])
             self.assertIsNotNone(job)
             self.assertEqual(job["filename"], src.name)
+
+
+class WorkerUploadTest(unittest.TestCase):
+    """worker.py's upload: reads WHY the server refused, and succeeds
+    normally. Uses tiny fake servers, no ffmpeg needed."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("worker_mod", ROOT / "worker" / "worker.py")
+        cls.w = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.w)
+
+    def _serve(self, handler_cls):
+        import http.server
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _file(self, mb):
+        t = tempfile.NamedTemporaryFile(delete=False)
+        t.write(os.urandom(1024 * 1024) * mb)
+        t.close()
+        self.addCleanup(os.unlink, t.name)
+        return t.name
+
+    def test_upload_ok(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers["Content-Length"])
+                while n > 0:
+                    n -= len(self.rfile.read(min(n, 1 << 20)))
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        port = self._serve(H)
+        srv = self.w.Server({"host": "127.0.0.1", "port": port, "name": "t"})
+        seen = []
+        res = srv.upload("j", self._file(5), "tok", on_progress=lambda n, t: seen.append(n))
+        self.assertTrue(res["ok"])
+        self.assertEqual(seen[-1], 5 * 1024 * 1024)
+
+    def test_upload_refused_early_reports_server_reason(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # refuse without reading the body, then close
+                body = b'{"error": "unknown job"}'
+                self.send_response(404)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+            def log_message(self, *a):
+                pass
+
+        port = self._serve(H)
+        srv = self.w.Server({"host": "127.0.0.1", "port": port, "name": "t"})
+        with self.assertRaises(self.w.UploadError) as cm:
+            srv.upload("j", self._file(60), "bad")
+        self.assertFalse(cm.exception.retry)
+        self.assertIn("404", str(cm.exception))
 
 
 if __name__ == "__main__":

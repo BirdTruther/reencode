@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -181,10 +182,29 @@ def banner(cfg, caps, ff_src):
         print()
 
 
+class UploadError(Exception):
+    def __init__(self, msg, retry=False):
+        super().__init__(msg)
+        self.retry = retry
+
+
+def xfer_text(icon, n, total, t0):
+    """'📥 42% · 90 MB / 217 MB · 85.1 MB/s · ETA 00:02' for a transfer."""
+    el = max(time.time() - t0, 0.001)
+    rate = n / el
+    eta = (total - n) / rate if rate > 0 and total else None
+    pct = f"{100.0 * n / total:.0f}% · " if total else ""
+    of = f"{fmt_mb(n)} / {fmt_mb(total)}" if total else f"{fmt_mb(n)}"
+    return f"  {icon} {pct}{of} · {rate / 1024 / 1024:.1f} MB/s · ETA {fmt_eta(eta)}"
+
+
 class Server:
     def __init__(self, cfg):
         self.base = f"http://{cfg['host']}:{cfg['port']}"
         self.name = cfg["name"]
+        self.host, self.port = cfg["host"], int(cfg["port"])
+        self.last_headers = {}
+        self.idle_reason = ""
 
     def _req(self, method, path, data=None, ctype=None, timeout=30):
         req = urllib.request.Request(self.base + path, method=method,
@@ -193,8 +213,10 @@ class Server:
             req.add_header("Content-Type", ctype)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
+                self.last_headers = r.headers
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
+            self.last_headers = e.headers
             return e.code, e.read()
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             raise IOError(f"cannot reach {self.base}: {e}")
@@ -203,6 +225,7 @@ class Server:
         q = urllib.parse.urlencode({"worker": self.name, "caps": caps})
         status, body = self._req("GET", f"/api/worker/next?{q}")
         if status == 204:
+            self.idle_reason = self.last_headers.get("X-Idle-Reason", "")
             return None
         if status != 200:
             raise IOError(f"next: HTTP {status}")
@@ -255,39 +278,53 @@ class Server:
             return True
 
     def upload(self, job_id, path, token, on_progress=None):
-        # Streamed with an explicit Content-Length so the server can read
-        # exactly the upload (no chunked encoding). The claim token goes in
-        # the query string: the body is raw bytes, not JSON.
+        """POST the encoded file. Streamed in 1 MB blocks over a plain
+        http.client connection so that, if the connection dies, we can
+        still read WHY from the server (it often answers and closes
+        before the body is sent). Raises UploadError(msg, retry=bool)."""
         size = os.path.getsize(path)
         qs = urllib.parse.urlencode({"token": token})
-        req = urllib.request.Request(
-            self.base + f"/api/worker/result/{job_id}?{qs}", method="POST",
-            headers={"Content-Type": "application/octet-stream",
-                     "Content-Length": str(size)})
-
-        class _Counter:
-            def __init__(self, f):
-                self.f = f
-                self.n = 0
-
-            def read(self, n=-1):
-                b = self.f.read(n)
-                if b:
-                    self.n += len(b)
-                    if on_progress:
-                        on_progress(self.n, size)
-                return b
-
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=300)
+        sent = 0
         try:
-            with open(path, "rb") as f:
-                req.data = _Counter(f)
-                with urllib.request.urlopen(req, timeout=3600) as r:
-                    body = r.read()
-        except urllib.error.HTTPError as e:
-            raise IOError(f"upload: HTTP {e.code}")
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            raise IOError(f"upload failed: {e}")
-        return json.loads(body or b"{}")
+            conn.putrequest("POST", f"/api/worker/result/{job_id}?{qs}")
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        block = f.read(1024 * 1024)
+                        if not block:
+                            break
+                        conn.send(block)
+                        sent += len(block)
+                        if on_progress:
+                            on_progress(sent, size)
+            except (OSError, http.client.HTTPException) as e:
+                # Connection died mid-send. Did the server say why?
+                try:
+                    r = conn.getresponse()
+                    msg = r.read().decode("utf-8", "replace")[:200]
+                    raise UploadError(f"the server refused it (HTTP {r.status}: {msg})",
+                                      retry=False)
+                except (OSError, http.client.HTTPException):
+                    raise UploadError(
+                        f"the connection dropped after {fmt_mb(sent)} of "
+                        f"{fmt_mb(size)} ({e.__class__.__name__}). A firewall, "
+                        f"antivirus or Wi-Fi hiccup is the usual suspect",
+                        retry=True)
+            conn.sock.settimeout(3600)  # the server verifies before answering
+            r = conn.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise UploadError(f"the server answered HTTP {r.status}",
+                                  retry=r.status >= 500)
+            return json.loads(body or b"{}")
+        except (OSError, http.client.HTTPException) as e:
+            raise UploadError(f"upload failed: {e}", retry=True)
+        finally:
+            conn.close()
 
     def fail(self, job_id, error, token):
         try:
@@ -360,9 +397,7 @@ def run_job(ff, srv, job, st, session):
         print(f"  📥 downloading…")
         t0 = time.time()
         srv.download(jid, src, total=job["size"],
-                     on_progress=lambda n, t: st.show(
-                         f"  📥 {100.0 * n / t:.0f}% · {fmt_mb(n)} / {fmt_mb(t)}"
-                         if t else f"  📥 {fmt_mb(n)} downloaded"))
+                     on_progress=lambda n, t: st.show(xfer_text("📥", n, t, t0)))
         st.end()
         print(f"  ✅ downloaded in {fmt_eta(time.time() - t0)}")
         if gone.is_set():
@@ -419,10 +454,25 @@ def run_job(ff, srv, job, st, session):
             return False
 
         print(f"  ✅ encoded in {fmt_eta(time.time() - t0)}")
-        print(f"  📤 uploading…")
-        res = srv.upload(jid, dst, token,
-                         on_progress=lambda n, t: st.show(
-                             f"  📤 {100.0 * n / t:.0f}% · {fmt_mb(n)} / {fmt_mb(t)}"))
+        print(f"  📤 uploading {fmt_mb(os.path.getsize(dst))} back to the server…")
+        res = None
+        for attempt in (1, 2, 3):
+            t0 = time.time()
+            try:
+                res = srv.upload(jid, dst, token,
+                                 on_progress=lambda n, t: st.show(
+                                     xfer_text("📤", n, t, t0)))
+                break
+            except UploadError as e:
+                st.end()
+                print(f"  ⚠️ upload problem: {e}")
+                if not e.retry or attempt == 3:
+                    print(f"     giving up on this one — telling the server.")
+                    srv.fail(jid, f"upload: {e}", token)
+                    session["failed"] += 1
+                    return False
+                print(f"     trying again ({attempt + 1}/3)…")
+                time.sleep(3)
         st.end()
         if res.get("ok"):
             session["done"] += 1
@@ -471,7 +521,11 @@ def main():
                 time.sleep(POLL_IDLE_SECS)
                 continue
             if not job:
-                st.show(f"  💤 nothing queued for me — waiting…   "
+                why = {"paused": "the queue is paused — press ▶ Start in the dashboard",
+                       "empty": "nothing is queued — add a title in the dashboard",
+                       "nothing": "queued titles have nothing I can take right now"
+                       }.get(getattr(srv, "idle_reason", ""), "nothing queued")
+                st.show(f"  💤 {why}…   "
                         f"✅ {session['done']} done · ❌ {session['failed']} failed")
                 time.sleep(POLL_IDLE_SECS)
                 continue
@@ -487,6 +541,7 @@ def main():
                 current.clear()
                 print(f"  ❌ unexpected problem: {e}")
                 traceback.print_exc()
+                srv.fail(job["job_id"], f"worker error: {e}", job["claim_token"])
                 outcome = False
                 session["failed"] += 1
             if outcome == "gone":
