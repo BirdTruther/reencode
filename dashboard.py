@@ -1304,8 +1304,15 @@ class App:
                     j["error"] = "lease expired (worker went away)"
             claimed = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
             done = {j["file"] for j in jobs.values() if j["status"] == "done"}
+            # A file that keeps failing (bad source, worker can't handle
+            # it) must not be re-downloaded forever: park it after 3
+            # failed attempts so someone can look at it.
+            failed_counts = collections.Counter(
+                j["file"] for j in jobs.values() if j["status"] == "failed")
             for t, f, action, full in self._worker_candidates():
                 if full in claimed or full in done:
+                    continue
+                if failed_counts[full] >= 3:
                     continue
                 needs = {"av1d"} if f.get("codec") == "av1" else set()
                 if not needs <= caps:
@@ -1314,6 +1321,7 @@ class App:
                 if not cmd:
                     continue
                 jid = uuid.uuid4().hex[:12]
+                token = uuid.uuid4().hex
                 jobs[jid] = {
                     "id": jid, "title": t["path"], "file": full,
                     "filename": f["name"], "size": f["size"],
@@ -1321,6 +1329,7 @@ class App:
                     "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
                     "out_h": cmd["out_h"], "duration": cmd["duration"],
                     "newbase": cmd["newbase"], "status": "claimed",
+                    "claim_token": token,
                     "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
                     "attempts": sum(1 for j in jobs.values()
                                     if j["file"] == full) + 1,
@@ -1328,7 +1337,8 @@ class App:
                 self._save_worker_jobs(jobs)
                 self.workers_seen[worker] = {"caps": sorted(caps), "last_seen": now}
                 j = jobs[jid]
-                return {"job_id": jid, "filename": j["filename"], "size": j["size"],
+                return {"job_id": jid, "claim_token": token,
+                        "filename": j["filename"], "size": j["size"],
                         "action": action, "argv": j["argv"], "out_w": j["out_w"],
                         "out_h": j["out_h"], "duration": j["duration"],
                         "lease_secs": WORKER_LEASE_SECS}
@@ -1337,44 +1347,62 @@ class App:
             self.workers_seen[worker]["last_seen"] = now
             return None
 
-    def worker_heartbeat(self, job_id):
+    def _worker_claim_ok(self, j, token):
+        return bool(j) and j["status"] == "claimed" and \
+            j.get("claim_token") == token
+
+    def worker_heartbeat(self, job_id, token):
         with self.worker_lock:
             jobs = self._load_worker_jobs()
             j = jobs.get(job_id)
-            if not j or j["status"] != "claimed":
+            if not self._worker_claim_ok(j, token):
                 return False
             j["lease_expires"] = time.time() + WORKER_LEASE_SECS
             self._save_worker_jobs(jobs)
             return True
 
-    def worker_fail(self, job_id, error):
+    def worker_fail(self, job_id, error, token):
         with self.worker_lock:
             jobs = self._load_worker_jobs()
             j = jobs.get(job_id)
-            if not j:
+            if not self._worker_claim_ok(j, token):
                 return False
             j["status"] = "failed"
             j["error"] = error[:500]
             self._save_worker_jobs(jobs)
             return True
 
-    def worker_finish(self, job_id, data_path):
-        """Verify a worker upload and place it in the library."""
+    def worker_finish(self, job_id, data_path, token):
+        """Verify a worker upload and place it in the library.
+
+        The --worker-place subprocess can take many minutes (big file
+        copy + verify), so it runs OUTSIDE worker_lock: holding the lock
+        would stall next/heartbeat/status and freeze the dashboard UI.
+        The claim token re-check after the run makes sure the job didn't
+        change hands (lease expiry + reclaim) while we were busy.
+        """
         with self.worker_lock:
             jobs = self._load_worker_jobs()
             j = jobs.get(job_id)
-            if not j or j["status"] != "claimed":
-                return {"ok": False, "error": "unknown or unclaimed job"}
-            try:
-                r = subprocess.run(
-                    ["bash", str(SCRIPT), "--worker-place", "--dir", j["title"],
-                     "--file", j["file"], "--result", data_path],
-                    capture_output=True, text=True, timeout=900,
-                    env=dict(os.environ, REENCODE_CONFIG=self.config["config_path"]))
-                lines = (r.stdout or "").strip().splitlines()
-                data = json.loads(lines[-1]) if lines else {}
-            except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
-                data = {"ok": False, "error": "worker-place failed to run"}
+            if not self._worker_claim_ok(j, token):
+                return {"ok": False, "error": "unknown job, not claimed, or token mismatch"}
+            title, path = j["title"], j["file"]
+        try:
+            r = subprocess.run(
+                ["bash", str(SCRIPT), "--worker-place", "--dir", title,
+                 "--file", path, "--result", data_path],
+                capture_output=True, text=True, timeout=900,
+                env=dict(os.environ, REENCODE_CONFIG=self.config["config_path"]))
+            lines = (r.stdout or "").strip().splitlines()
+            data = json.loads(lines[-1]) if lines else {}
+        except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
+            data = {"ok": False, "error": "worker-place failed to run"}
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            j = jobs.get(job_id)
+            if not self._worker_claim_ok(j, token):
+                return {"ok": False,
+                        "error": "job changed while placing; not marking done"}
             if data.get("ok"):
                 j["status"] = "done"
             else:
@@ -1687,16 +1715,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._worker_send_file(parts[3])
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "heartbeat":
-            ok = app.worker_heartbeat(parts[3])
+            data = self._json_body() or {}
+            ok = app.worker_heartbeat(parts[3], data.get("token", ""))
             return self._send(200, {"ok": ok, "lease_secs": WORKER_LEASE_SECS})
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "fail":
             data = self._json_body() or {}
-            app.worker_fail(parts[3], str(data.get("error", "")))
+            app.worker_fail(parts[3], str(data.get("error", "")), data.get("token", ""))
             return self._send(200, {"ok": True})
         if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
                 and parts[2] == "result":
-            return self._worker_receive_result(parts[3])
+            token = (q.get("token") or [""])[0]
+            return self._worker_receive_result(parts[3], token)
         return self._send(404, {"error": "Not found"})
 
     def _worker_send_file(self, job_id):
@@ -1716,7 +1746,15 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, BrokenPipeError):
             pass
 
-    def _worker_receive_result(self, job_id):
+    def _worker_receive_result(self, job_id, token):
+        # Validate the claim BEFORE touching the body: no point writing
+        # up to 200GB to temp_dir for a job that doesn't exist, isn't
+        # claimed, or belongs to a different claim. close_connection so
+        # the unread body can't poison a keep-alive connection.
+        j = self.app.worker_job(job_id)
+        if not self.app._worker_claim_ok(j, token):
+            self.close_connection = True
+            return self._send(404, {"error": "unknown job, not claimed, or token mismatch"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -1741,7 +1779,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self._send(400, {"error": "upload failed"})
-        result = self.app.worker_finish(job_id, tmp)
+        result = self.app.worker_finish(job_id, tmp, token)
         try:
             os.unlink(tmp)
         except OSError:
