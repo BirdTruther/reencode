@@ -355,6 +355,21 @@ class WorkerProtocolTest(unittest.TestCase):
         self.assertIsNotNone(nxt)
         self.assertEqual(nxt.path, str(dirs["Film"]))
 
+    def test_local_takes_file_the_worker_gave_up_on(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        app.jobs.enqueue(dirs["Film"])
+        app.workers_seen["w1"] = {"caps": ["software"], "last_seen": time.time()}
+        for _ in range(3):
+            job = app.worker_next("w1", ["software"])
+            app.worker_fail(job["job_id"], "boom", job["claim_token"])
+        app.workers_seen["w1"] = {"caps": ["software"], "last_seen": time.time()}
+        # parked after 3 failures: the idle worker can't claim it, so the
+        # local runner must take it instead of waiting forever
+        self.assertIsNone(app.worker_next("w1", ["software"]))
+        nxt = app._local_next_title()
+        self.assertIsNotNone(nxt)
+        self.assertEqual(nxt.path, str(dirs["Film"]))
+
     def test_startup_grace_waits_for_worker_checkin(self):
         _base, _conf, app, dirs = self._ctx("Film")
         app.jobs.enqueue(dirs["Film"])
@@ -435,8 +450,16 @@ class WorkerProtocolTest(unittest.TestCase):
             d = base / "Movies" / "AV1Film"
             src = d / "AV1Film 1080p.mkv"
             src.parent.mkdir(parents=True, exist_ok=True)
-            run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
-                       "-c:v", "libsvtav1", "-preset", "10", str(src))
+            # libsvtav1 isn't in every ffmpeg build; libaom-av1 is the fallback
+            try:
+                run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
+                           "-c:v", "libsvtav1", "-preset", "10", str(src))
+            except subprocess.CalledProcessError:
+                try:
+                    run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
+                               "-c:v", "libaom-av1", "-cpu-used", "8", str(src))
+                except subprocess.CalledProcessError:
+                    self.skipTest("this ffmpeg has no AV1 encoder")
             self.assertEqual(dashboard.ffprobe(str(src))["codec"], "av1")
             conf = write_conf(base)
             app = self._make_app(base, conf)

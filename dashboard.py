@@ -876,8 +876,9 @@ class JobRunner:
         self.current = None
         self.waiting_external = False
         self.waiting_schedule = False
-        self.paused = False  # queue Start/Pause: when paused, neither the
-        # local runner nor workers pick up new jobs; the running job finishes.
+        self.paused = True  # queue Start/Pause: build the queue, then press
+        # Start. While paused, neither the local runner nor workers pick up
+        # new jobs; a running job finishes.
         self.started_at = time.time()
         try:
             self.history = json.loads(HISTORY_FILE.read_text())
@@ -1444,6 +1445,8 @@ class App:
                           if j["status"] == "done"}
             busy = {j["worker"] for j in wjobs.values()
                     if j["status"] == "claimed"}
+            failed_counts = collections.Counter(
+                j["file"] for j in wjobs.values() if j["status"] == "failed")
             now = time.time()
             idle = [(n, w["caps"]) for n, w in self.workers_seen.items()
                     if now - w["last_seen"] < 45 and n not in busy]
@@ -1475,9 +1478,14 @@ class App:
                         if any(full in claimed_files
                                for _f, _a, full in actionable):
                             continue  # a worker owns this title for now
-                        f0, _a0, _full0 = actionable[0]
-                        needs = {"av1d"} if f0.get("codec") == "av1" else set()
-                        if any(needs <= set(caps) for _n, caps in idle):
+                        # Files a worker gave up on (3 failures) are the
+                        # local runner's job; only yield for a file an idle
+                        # worker can actually still claim.
+                        takeable = [f for f, _a, full in actionable
+                                    if failed_counts[full] < 3]
+                        if any(({"av1d"} if f.get("codec") == "av1" else set())
+                               <= set(caps)
+                               for f in takeable for _n, caps in idle):
                             yield_wait = True  # an idle worker claims shortly
                             break
                         pick = j
