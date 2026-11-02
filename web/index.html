@@ -285,6 +285,14 @@ dialog::backdrop { background: rgba(10,12,16,.5); backdrop-filter: blur(2px); }
     <ul class="qlist" id="queueList"></ul>
   </section>
 
+  <section class="card" id="workerCard" hidden>
+    <div class="card-h"><h2>Remote workers</h2><span class="muted" id="workerCount"></span></div>
+    <div class="card-b" style="padding-top:10px">
+      <div class="muted" id="workerList" style="margin-bottom:10px"></div>
+      <div style="overflow-x:auto"><table class="files" id="workerJobs"></table></div>
+    </div>
+  </section>
+
   <section class="card">
     <div class="card-h" style="border-bottom:0;padding-bottom:4px">
       <h2>Library</h2>
@@ -474,9 +482,28 @@ async function refresh() {
   try {
     S = await api("/api/state");
     render();
+    try { renderWorkers(await api("/api/worker/status")); } catch { /* workers optional */ }
   } catch (e) {
     $("#scanpill").innerHTML = `<span class="dot" style="background:var(--err)"></span><span>Disconnected</span>`;
   }
+}
+
+function renderWorkers(w) {
+  const card = $("#workerCard");
+  const has = w.workers.length || w.claimed || w.done || w.failed || w.pending;
+  card.hidden = !has;
+  if (!has) return;
+  $("#workerCount").textContent =
+    `${w.pending} waiting · ${w.claimed} encoding · ${w.done} done` + (w.failed ? ` · ${w.failed} failed` : "");
+  $("#workerList").innerHTML = w.workers.length
+    ? w.workers.map(x => `<span class="pill">${esc(x.name)} <span class="faint">${esc(x.caps.join(", "))}</span> <span class="faint">· ${x.last_seen_secs_ago}s ago</span></span>`).join(" ")
+    : `<span class="faint">no workers seen yet — run worker/worker.py on another machine</span>`;
+  const st = { claimed: "to shrink", done: "kept", failed: "unreadable" };
+  $("#workerJobs").innerHTML = w.recent.map(j =>
+    `<tr><td class="mono" style="word-break:break-all">${esc(j.filename)}</td>` +
+    `<td class="muted">${esc(j.worker)}</td>` +
+    `<td class="why ${j.status === "done" ? "ok" : j.status === "claimed" ? "encode" : "unknown"}"` +
+    (j.error ? ` title="${esc(j.error)}"` : "") + `>${st[j.status] || j.status}</td></tr>`).join("");
 }
 let timer;
 function schedule() {

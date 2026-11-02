@@ -18,6 +18,12 @@ ALLOW_FAILURES=false
 SETUP=false
 PLAN_ONLY=false
 MAX_FILES=0
+WORKER_CMD=false
+WORKER_PLACE=false
+WORKER_FILE=""
+WORKER_RESULT=""
+WORKER_ENCODER=""
+WORKER_DECODE="cpu"
 
 # Circuit breaker state for the whole batch (not per title): consecutive
 # failures, the error signature of the last one, and whether it tripped.
@@ -47,6 +53,10 @@ Options:
   --allow-failures    Replace the episodes that succeeded even if others failed
   --max N             Stop after N files (testing; originals are not replaced)
   --setup             Re-run first-time config wizard
+  --worker-cmd        Print the ffmpeg command a remote worker should run
+                      (needs --dir, --file, --worker-encoder; --worker-decode gpu|cpu)
+  --worker-place      Verify and place a worker-uploaded result
+                      (needs --dir, --file, --result)
   --help              Show this help
 
 Config is auto-generated at ${CONFIG_PATH} on first run. Edit it to change
@@ -77,6 +87,20 @@ parse_args() {
             --force) FORCE=true; shift ;;
             --allow-failures) ALLOW_FAILURES=true; shift ;;
             --setup) SETUP=true; shift ;;
+            --worker-cmd) WORKER_CMD=true; shift ;;
+            --worker-place) WORKER_PLACE=true; shift ;;
+            --file|--result|--worker-encoder|--worker-decode)
+                if [[ $# -lt 2 ]]; then
+                    log_err "$1 needs a value"
+                    exit 1
+                fi
+                case "$1" in
+                    --file) WORKER_FILE="$2" ;;
+                    --result) WORKER_RESULT="$2" ;;
+                    --worker-encoder) WORKER_ENCODER="$2" ;;
+                    --worker-decode) WORKER_DECODE="$2" ;;
+                esac
+                shift 2 ;;
             --help|-h) usage ;;
             *) log_err "Unknown option: $1"; usage ;;
         esac
@@ -767,6 +791,26 @@ main() {
     setup_dirs
     trap on_interrupt INT TERM
 
+    # Remote-worker modes: print an encode command or place an uploaded
+    # result. These need no local encoder, so they run before
+    # setup_encoder/check_encoder.
+    if [[ "$WORKER_CMD" == true ]]; then
+        if [[ -z "$SHOW_DIR" ]]; then
+            printf '{"error":"--worker-cmd needs --dir"}\n'
+            exit 2
+        fi
+        worker_cmd_mode "${SHOW_DIR%/}"
+        exit $?
+    fi
+    if [[ "$WORKER_PLACE" == true ]]; then
+        if [[ -z "$SHOW_DIR" ]]; then
+            printf '{"error":"--worker-place needs --dir"}\n'
+            exit 2
+        fi
+        worker_place_mode "${SHOW_DIR%/}"
+        exit $?
+    fi
+
     if [[ "$CLEAR_NO_SAVINGS" == true ]]; then
         clear_no_savings
         log_ok "Cleared no-savings list ($(NO_SAVINGS_LIST))"
@@ -840,6 +884,143 @@ main() {
     else
         process_all
     fi
+}
+
+# JSON-escape a string for the worker protocol output.
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+# Print the named bash array as a JSON array of strings.
+json_array() {
+    local -n _arr=$1
+    local e out=""
+    for e in "${_arr[@]}"; do
+        [[ -n "$out" ]] && out+=","
+        out+="\"$(json_escape "$e")\""
+    done
+    printf '[%s]' "$out"
+}
+
+# Remote-worker support (v0): print the exact ffmpeg command a worker
+# should run for a file, as JSON. __INPUT__ and __OUTPUT__ are
+# placeholders the worker substitutes with its own local paths.
+# Encoder settings (filters, codec args, quality) come from the same
+# code path as local encodes, so the worker never duplicates them.
+# Usage: reencode.sh --worker-cmd --dir <title> --file <path>
+#                       --worker-encoder <vaapi|nvenc|software>
+#                       [--worker-decode <gpu|cpu>]
+worker_cmd_mode() {
+    local dir="${1%/}" input="$WORKER_FILE"
+    if [[ -z "$dir" || -z "$input" || ! -f "$input" ]]; then
+        printf '{"error":"need --dir <title> and --file <existing file>"}\n'
+        return 2
+    fi
+    case "$WORKER_ENCODER" in
+        vaapi|nvenc|software) ;;
+        *) printf '{"error":"need --worker-encoder <vaapi|nvenc|software>"}\n'; return 2 ;;
+    esac
+    apply_profile "$dir"
+    local saved_encoder="$ENCODER"
+    ENCODER="$WORKER_ENCODER"
+    setup_encoder
+    ENCODER="$saved_encoder"
+
+    title_files "$dir"
+    plan_title "${TITLE_FILES[@]}"
+    local action="${PLAN["$input"]:-}"
+    if [[ "$action" != encode && "$action" != makecopy ]]; then
+        printf '{"error":"no work planned for this file (%s)"}\n' \
+            "$(json_escape "${WHY["$input"]:-unknown}")"
+        return 2
+    fi
+    if ! output_dims "$input"; then
+        printf '{"error":"cannot read the video"}\n'
+        return 1
+    fi
+    local stream=${STREAMS["$input"]:-$V_INDEX}
+    # set_filters keys off $ENCODER, so point it at the worker's encoder
+    # while building the filter pair.
+    ENCODER="$WORKER_ENCODER"
+    set_filters "$OUT_W" "$OUT_H" "$input" "$stream"
+    ENCODER="$saved_encoder"
+
+    local -a pre=()
+    local vf
+    if [[ "$WORKER_DECODE" == gpu && -n "${GPU_PRE[*]:-}" ]]; then
+        pre=("${GPU_PRE[@]}"); vf="$GPU_VF"
+    else
+        pre=("${ENC_PRE[@]}"); vf="$ENC_VF"
+    fi
+
+    local filename base newbase ext
+    filename=$(basename "$input")
+    base="${filename%.*}"
+    ext="${filename##*.}"
+    newbase=$(build_newbase "$base")
+    local -a sub_args=()
+    case "${ext,,}" in
+        mp4|m4v) sub_args=(-c:s srt) ;;
+    esac
+
+    local -a argv=(ffmpeg -nostdin -hide_banner -loglevel warning -stats -y
+        "${pre[@]}" -i "__INPUT__"
+        -map "0:${stream}" -map '0:a?' -map '0:s?' -map '0:t?'
+        -c:a copy -c:s copy -c:t copy
+        -vf "$vf" "${ENC_V[@]}" "${sub_args[@]}"
+        -max_muxing_queue_size 1024 -f matroska "__OUTPUT__")
+
+    local duration size_mb
+    duration=$(get_duration "$input")
+    size_mb=$(get_file_size_mb "$input")
+    printf '{"action":"%s","newbase":"%s","out_w":%d,"out_h":%d,"duration":"%s","size_mb":%d,"argv":%s}\n' \
+        "$action" "$(json_escape "$newbase")" "$OUT_W" "$OUT_H" \
+        "$(json_escape "${duration:-}")" "$size_mb" "$(json_array argv)"
+}
+
+# Remote-worker support (v0): verify a worker-uploaded result and put it
+# in the library (replace the original, or add a companion copy for
+# makecopy), exactly as if it had been encoded locally.
+# Usage: reencode.sh --worker-place --dir <title> --file <original>
+#                       --result <uploaded file>
+worker_place_mode() {
+    local dir="${1%/}" input="$WORKER_FILE" result="$WORKER_RESULT"
+    if [[ -z "$dir" || -z "$input" || -z "$result" || ! -f "$result" ]]; then
+        printf '{"ok":false,"error":"need --dir, --file and --result <existing file>"}\n'
+        return 2
+    fi
+    apply_profile "$dir"
+    title_files "$dir"
+    plan_title "${TITLE_FILES[@]}"
+    local action="${PLAN["$input"]:-}"
+    if [[ "$action" != encode && "$action" != makecopy ]]; then
+        printf '{"ok":false,"error":"no work planned for this file"}\n'
+        return 2
+    fi
+    if ! verify_output "$input" "$result"; then
+        printf '{"ok":false,"error":"verification failed"}\n'
+        return 1
+    fi
+    if [[ "$action" == makecopy ]]; then
+        place_copy "$input" "$result" \
+            || { printf '{"ok":false,"error":"place_copy failed"}\n'; return 1; }
+    else
+        local filename base newbase outfile
+        filename=$(basename "$input")
+        base="${filename%.*}"
+        newbase=$(build_newbase "$base")
+        outfile="${TEMP_DIR}/${newbase}.mkv"
+        cp -- "$result" "$outfile"
+        replace_original "$input" \
+            || { printf '{"ok":false,"error":"replace_original failed"}\n'; return 1; }
+    fi
+    printf '{"ok":true,"action":"%s"}\n' "$action"
 }
 
 # Only run when executed directly, not when sourced (e.g. by tests

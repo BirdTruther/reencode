@@ -134,6 +134,33 @@ When a folder has several versions of the same video, only one of them is ever s
 
 Stopping, pausing, a crash or a full disk never replaces a good file with a broken one. All audio tracks and subtitles are kept, and subtitle files next to the video are renamed to match.
 
+## Remote workers (borrow another machine's GPU)
+
+Got a file your server can't handle — like AV1 on a GPU with no AV1
+decoder — or just want a faster machine to help? Run the worker script on
+any PC (Windows included) and it will pull encode jobs from the
+dashboard, run them with its own hardware, and hand the results back.
+The server verifies every result and swaps it into the library itself;
+the worker never touches your files.
+
+```bash
+# on the other machine: needs Python 3.9+ and ffmpeg in PATH
+python worker/worker.py        # asks for the server IP + port once, then polls
+```
+
+How it works: the worker advertises what it can do (`nvenc`, `cuda`,
+`av1d`, ...), the dashboard hands it the next planned file plus the
+exact ffmpeg command to run (built from the same code as local encodes,
+so quality and filters match), and the worker streams the source down,
+encodes, and uploads the result. Jobs have a 10-minute lease with
+heartbeats — kill the worker any time (to go game, say) and the job
+just goes back in the queue. A "Remote workers" card on the dashboard
+shows who's connected and what they're doing.
+
+v0 notes: LAN only with no worker login (same trust model as the
+dashboard itself), one job at a time per worker, and don't run a local
+dashboard Encode on the same title while a worker has its files.
+
 ## Other ways to run it
 
 <details>
