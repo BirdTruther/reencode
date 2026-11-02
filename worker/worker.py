@@ -40,6 +40,62 @@ POLL_IDLE_SECS = 15
 HEARTBEAT_SECS = 60
 
 
+def enable_vt():
+    """Let Windows consoles render ANSI colors (Win10+). Harmless elsewhere."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, mode.value | 4)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+    try:
+        os.system("")  # backup trick that also enables VT processing
+    except Exception:
+        pass
+
+
+class C:
+    """ANSI colors -- only used when stdout is a real terminal."""
+    GREEN = "\033[32m"
+    DIM = "\033[2m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    CYAN = "\033[36m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    @classmethod
+    def off(cls):
+        for a in ("GREEN", "DIM", "YELLOW", "RED", "CYAN", "BOLD", "RESET"):
+            setattr(cls, a, "")
+
+
+def colors_ok():
+    """True when the terminal will actually render ANSI colors."""
+    if not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            v = sys.getwindowsversion()
+            return v.major >= 10 and v.build >= 10586  # TH2+: VT support
+        except Exception:
+            return False
+    return True
+
+
+def bar(pct, width=24):
+    """A visual progress bar: '████████████░░░░░░░░░░'."""
+    pct = max(0.0, min(100.0, pct if pct is not None else 0.0))
+    filled = int(width * pct / 100.0)
+    return (C.GREEN + "█" * filled + C.DIM + "░" * (width - filled)
+            + C.RESET)
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -151,7 +207,7 @@ class StatusLine:
             self._pad = max(self._pad, len(text))
             sys.stdout.write("\r" + text.ljust(self._pad))
             sys.stdout.flush()
-        elif time.time() - self._last_print > 60:
+        elif time.time() - self._last_print > 15:
             self._last_print = time.time()
             print(text, flush=True)
 
@@ -188,14 +244,15 @@ class UploadError(Exception):
         self.retry = retry
 
 
-def xfer_text(icon, n, total, t0):
-    """'📥 42% · 90 MB / 217 MB · 85.1 MB/s · ETA 00:02' for a transfer."""
+def xfer_text(icon, label, n, total, t0):
+    """'📥 Downloading [██████░░░░]  42% · 90 / 217 MB · 85 MB/s · ETA 00:02'."""
     el = max(time.time() - t0, 0.001)
     rate = n / el
     eta = (total - n) / rate if rate > 0 and total else None
-    pct = f"{100.0 * n / total:.0f}% · " if total else ""
-    of = f"{fmt_mb(n)} / {fmt_mb(total)}" if total else f"{fmt_mb(n)}"
-    return f"  {icon} {pct}{of} · {rate / 1024 / 1024:.1f} MB/s · ETA {fmt_eta(eta)}"
+    pct = 100.0 * n / total if total else 0.0
+    of = f"{fmt_mb(n)} / {fmt_mb(total)}" if total else fmt_mb(n)
+    return (f"  {icon} {label} {bar(pct)} {pct:5.1f}% · {of} · "
+            f"{rate / 1024 / 1024:.0f} MB/s · ETA {fmt_eta(eta)}")
 
 
 class Server:
@@ -364,7 +421,7 @@ def parse_progress(line, duration):
     return pct, speed
 
 
-def run_job(ff, srv, job, st, session):
+def run_job(ff, srv, job, st, session, caps):
     """Run one claimed job. Returns True (done), False (failed), or
     "gone" (the server cancelled it mid-job)."""
     jid = job["job_id"]
@@ -375,9 +432,16 @@ def run_job(ff, srv, job, st, session):
     src = os.path.join(WORK_DIR, f"{jid}_in.mkv")
     dst = os.path.join(WORK_DIR, f"{jid}_out.mkv")
 
-    print(f"\n  ━━━ 🎯 new job ━━━")
-    print(f"  📄 {name}")
-    print(f"  {fmt_mb(job['size'])}  →  {job['out_w']}x{job['out_h']} HEVC")
+    print(f"\n  {C.DIM}{'━' * 52}{C.RESET}")
+    print(f"  🎯 {C.BOLD}{name}{C.RESET}")
+    dur = job.get("duration")
+    try:
+        dur_s = f"  ·  {fmt_eta(float(dur))} long" if dur else ""
+    except (TypeError, ValueError):
+        dur_s = ""
+    engine = "GPU" if "nvenc" in caps else "CPU"
+    print(f"  {C.DIM}{fmt_mb(job['size'])}  →  {job['out_w']}x{job['out_h']} HEVC"
+          f"{dur_s}  ·  encoding on {engine}{C.RESET}")
 
     stop = threading.Event()
     gone = threading.Event()
@@ -397,7 +461,8 @@ def run_job(ff, srv, job, st, session):
         print(f"  📥 downloading…")
         t0 = time.time()
         srv.download(jid, src, total=job["size"],
-                     on_progress=lambda n, t: st.show(xfer_text("📥", n, t, t0)))
+                     on_progress=lambda n, t: st.show(
+                         xfer_text("📥", "Downloading", n, t, t0)))
         st.end()
         print(f"  ✅ downloaded in {fmt_eta(time.time() - t0)}")
         if gone.is_set():
@@ -406,16 +471,20 @@ def run_job(ff, srv, job, st, session):
         argv = [a.replace("__INPUT__", src).replace("__OUTPUT__", dst)
                 for a in job["argv"]]
         argv[0] = ff  # use the ffmpeg we checked, not whatever is first on PATH
-        # Drop -stats (it spams the console); progress is parsed from stderr.
-        argv = [a for a in argv if a != "-stats"]
+        # NOTE: -stats MUST stay: it is what makes ffmpeg print the
+        # frame=/time=/speed= progress lines we parse below. stderr is
+        # piped (never shown), so it can't spam the console.
 
         print(f"  🔨 encoding…")
         t0 = time.time()
         tail = []
+        last_show = 0
         proc = subprocess.Popen(argv, stderr=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, text=True,
-                                errors="replace")
-        for line in proc.stderr:
+                                errors="replace", bufsize=1)
+        # readline (not `for line in`) avoids pipe readahead buffering so
+        # the bar updates smoothly instead of in bursts.
+        for line in iter(proc.stderr.readline, ""):
             if gone.is_set():
                 proc.terminate()
                 try:
@@ -430,14 +499,23 @@ def run_job(ff, srv, job, st, session):
             pct, speed = parse_progress(line, job.get("duration"))
             if pct is not None:
                 prog["pct"] = pct
-            if pct is not None or speed is not None:
-                eta = None
-                el = time.time() - t0
-                if pct and pct > 1:
-                    eta = el * (100 - pct) / pct
-                st.show(f"  🔨 {pct:.0f}% · {speed:.1f}x speed · ETA {fmt_eta(eta)}"
-                        if pct is not None and speed else
-                        f"  🔨 warming up…")
+            if pct is None and speed is None:
+                continue
+            now = time.time()
+            if now - last_show < 0.25:
+                continue  # throttle: the bar doesn't need 60fps
+            last_show = now
+            el = now - t0
+            if pct is not None:
+                eta = el * (100 - pct) / pct if pct > 0.5 else None
+                spd = f"{speed:.1f}x" if speed else "--"
+                st.show(f"  🔨 Encoding {bar(pct)} {pct:5.1f}% · "
+                        f"{spd} · ETA {fmt_eta(eta)}")
+            else:
+                # No duration from the server: show what we know.
+                spd = f"{speed:.1f}x · " if speed else ""
+                st.show(f"  🔨 Encoding {spd}elapsed {fmt_eta(el)} "
+                        f"(no duration info)")
         rc = proc.wait()
         proc = None
         st.end()
@@ -461,7 +539,7 @@ def run_job(ff, srv, job, st, session):
             try:
                 res = srv.upload(jid, dst, token,
                                  on_progress=lambda n, t: st.show(
-                                     xfer_text("📤", n, t, t0)))
+                                     xfer_text("📤", "Uploading", n, t, t0)))
                 break
             except UploadError as e:
                 st.end()
@@ -508,6 +586,9 @@ def main():
     caps = detect_caps(ff)
     srv = Server(cfg)
     st = StatusLine()
+    enable_vt()
+    if not colors_ok():
+        C.off()  # no ANSI escapes when piped or on ancient consoles
     session = {"done": 0, "failed": 0}
     banner(cfg, caps, ff_src)
 
@@ -533,7 +614,7 @@ def main():
             current["jid"] = job["job_id"]
             current["token"] = job["claim_token"]
             try:
-                outcome = run_job(ff, srv, job, st, session)
+                outcome = run_job(ff, srv, job, st, session, caps)
                 current.clear()
             except KeyboardInterrupt:
                 raise  # current stays set: the handler below releases it
