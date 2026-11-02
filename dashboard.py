@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import ssl
 import subprocess
@@ -1172,13 +1173,20 @@ _APP = None
 # ── App / HTTP ─────────────────────────────────────────────────────────────
 
 def set_state_dir(d):
-    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE, QUEUE_FILE
+    global PROBE_CACHE, HISTORY_FILE, PASSWORD_FILE, QUEUE_FILE, WORKER_JOBS_FILE
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
     PROBE_CACHE = d / ".dashboard_cache.json"
     HISTORY_FILE = d / ".dashboard_history.json"
     PASSWORD_FILE = d / ".dashboard_password"
     QUEUE_FILE = d / ".dashboard_queue.json"
+    WORKER_JOBS_FILE = d / ".worker_jobs.json"
+
+
+# Remote workers (v0): a claimed job must be heartbeated or completed
+# within this long, or it goes back in the queue. This is what makes
+# killing the worker (to go game) safe.
+WORKER_LEASE_SECS = 600
 
 
 class App:
@@ -1190,6 +1198,8 @@ class App:
         set_state_dir(Path(self.config["config_path"]).parent)
         self.library = Library(self)
         self.jobs = JobRunner(self)
+        self.worker_lock = threading.Lock()
+        self.workers_seen = {}
 
     def reload_config(self):
         self.config = load_config()
@@ -1222,6 +1232,179 @@ class App:
         else:
             self.keep4k_overrides.pop(path, None)
         write_4k_overrides(self.config["overrides_4k_file"], self.keep4k_overrides)
+
+    # ---- remote workers (v0) ----
+    def _load_worker_jobs(self):
+        try:
+            with open(WORKER_JOBS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_worker_jobs(self, jobs):
+        tmp = str(WORKER_JOBS_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(jobs, f)
+        os.replace(tmp, WORKER_JOBS_FILE)
+
+    def worker_job(self, job_id):
+        with self.worker_lock:
+            return self._load_worker_jobs().get(job_id)
+
+    def _worker_candidates(self):
+        """Files currently planned as encode/makecopy, across all titles.
+
+        Yields (title, file, action, full_path); scanned file dicts carry
+        "rel" (path relative to the title), not an absolute "path"."""
+        out = []
+        with self.library.lock:
+            titles = list(self.library.titles.values())
+        for t in titles:
+            if not t["files"]:
+                continue
+            ts = self.title_settings(t)
+            if ts["skip"]:
+                continue
+            plan = plan_files(t["files"], ts["height"], ts["keep_4k"], ts["skip"], ts["profile"])
+            for f, (action, _why) in zip(t["files"], plan):
+                if action in ("encode", "makecopy"):
+                    out.append((t, f, action, os.path.join(t["path"], f["rel"])))
+        out.sort(key=lambda x: (x[0]["path"], x[3]))
+        return out
+
+    def _worker_cmd(self, title_dir, path, caps):
+        """Build the worker's ffmpeg command via reencode.sh --worker-cmd."""
+        if "nvenc" in caps:
+            enc, dec = "nvenc", "gpu" if "cuda" in caps else "cpu"
+        elif "vaapi" in caps:
+            enc, dec = "vaapi", "gpu"
+        else:
+            enc, dec = "software", "cpu"
+        try:
+            r = subprocess.run(
+                ["bash", str(SCRIPT), "--worker-cmd", "--dir", title_dir,
+                 "--file", path, "--worker-encoder", enc, "--worker-decode", dec],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, REENCODE_CONFIG=self.config["config_path"]))
+            data = json.loads(r.stdout or "{}")
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+        return data if isinstance(data, dict) and "argv" in data else None
+
+    def worker_next(self, worker, caps):
+        """Claim the next job for a worker, or None if there's nothing."""
+        caps = {c.strip().lower() for c in caps if c.strip()}
+        now = time.time()
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            for j in jobs.values():
+                if j["status"] == "claimed" and j["lease_expires"] < now:
+                    j["status"] = "failed"
+                    j["error"] = "lease expired (worker went away)"
+            claimed = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
+            done = {j["file"] for j in jobs.values() if j["status"] == "done"}
+            for t, f, action, full in self._worker_candidates():
+                if full in claimed or full in done:
+                    continue
+                needs = {"av1d"} if f.get("codec") == "av1" else set()
+                if not needs <= caps:
+                    continue
+                cmd = self._worker_cmd(t["path"], full, caps)
+                if not cmd:
+                    continue
+                jid = uuid.uuid4().hex[:12]
+                jobs[jid] = {
+                    "id": jid, "title": t["path"], "file": full,
+                    "filename": f["name"], "size": f["size"],
+                    "worker": worker, "caps": sorted(caps), "needs": sorted(needs),
+                    "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
+                    "out_h": cmd["out_h"], "duration": cmd["duration"],
+                    "newbase": cmd["newbase"], "status": "claimed",
+                    "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
+                    "attempts": sum(1 for j in jobs.values()
+                                    if j["file"] == full) + 1,
+                }
+                self._save_worker_jobs(jobs)
+                self.workers_seen[worker] = {"caps": sorted(caps), "last_seen": now}
+                j = jobs[jid]
+                return {"job_id": jid, "filename": j["filename"], "size": j["size"],
+                        "action": action, "argv": j["argv"], "out_w": j["out_w"],
+                        "out_h": j["out_h"], "duration": j["duration"],
+                        "lease_secs": WORKER_LEASE_SECS}
+            self._save_worker_jobs(jobs)
+            self.workers_seen.setdefault(worker, {"caps": sorted(caps), "last_seen": now})
+            self.workers_seen[worker]["last_seen"] = now
+            return None
+
+    def worker_heartbeat(self, job_id):
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            j = jobs.get(job_id)
+            if not j or j["status"] != "claimed":
+                return False
+            j["lease_expires"] = time.time() + WORKER_LEASE_SECS
+            self._save_worker_jobs(jobs)
+            return True
+
+    def worker_fail(self, job_id, error):
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            j = jobs.get(job_id)
+            if not j:
+                return False
+            j["status"] = "failed"
+            j["error"] = error[:500]
+            self._save_worker_jobs(jobs)
+            return True
+
+    def worker_finish(self, job_id, data_path):
+        """Verify a worker upload and place it in the library."""
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            j = jobs.get(job_id)
+            if not j or j["status"] != "claimed":
+                return {"ok": False, "error": "unknown or unclaimed job"}
+            try:
+                r = subprocess.run(
+                    ["bash", str(SCRIPT), "--worker-place", "--dir", j["title"],
+                     "--file", j["file"], "--result", data_path],
+                    capture_output=True, text=True, timeout=900,
+                    env=dict(os.environ, REENCODE_CONFIG=self.config["config_path"]))
+                lines = (r.stdout or "").strip().splitlines()
+                data = json.loads(lines[-1]) if lines else {}
+            except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
+                data = {"ok": False, "error": "worker-place failed to run"}
+            if data.get("ok"):
+                j["status"] = "done"
+            else:
+                j["status"] = "failed"
+                j["error"] = str(data.get("error") or "place failed")[:500]
+            self._save_worker_jobs(jobs)
+            return {"ok": bool(data.get("ok")), "error": data.get("error")}
+
+    def worker_status(self):
+        with self.worker_lock:
+            jobs = self._load_worker_jobs()
+            seen = dict(self.workers_seen)
+        now = time.time()
+        claimed_files = {j["file"] for j in jobs.values() if j["status"] == "claimed"}
+        done_files = {j["file"] for j in jobs.values() if j["status"] == "done"}
+        pending = sum(1 for _t, _f, _a, full in self._worker_candidates()
+                      if full not in claimed_files and full not in done_files)
+        recent = sorted(jobs.values(), key=lambda j: j.get("claimed_at", 0), reverse=True)[:15]
+        return {
+            "workers": [{"name": n, "caps": w["caps"],
+                         "last_seen_secs_ago": int(now - w["last_seen"])}
+                        for n, w in seen.items()],
+            "pending": pending,
+            "claimed": sum(1 for j in jobs.values() if j["status"] == "claimed"),
+            "done": sum(1 for j in jobs.values() if j["status"] == "done"),
+            "failed": sum(1 for j in jobs.values() if j["status"] == "failed"),
+            "recent": [{"id": j["id"], "filename": j["filename"], "worker": j["worker"],
+                        "action": j["action"], "status": j["status"],
+                        "error": j.get("error", "")} for j in recent],
+        }
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""
@@ -1450,6 +1633,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_logout()
         if self._rate_limited():
             return
+        # Remote-worker API (v0): LAN-only, no login. The dashboard isn't
+        # exposed to the web; workers on the local network are trusted.
+        if url.path.startswith("/api/worker/"):
+            return self._worker_api(url)
         if not self._authed():
             return self._deny()
         q = parse_qs(url.query)
@@ -1482,12 +1669,93 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "Not found"})
         return self._send(404, {"error": "Not found"})
 
+    def _worker_api(self, url):
+        """Remote-worker endpoints (v0). No login: LAN-only by design."""
+        q = parse_qs(url.query)
+        parts = url.path.strip("/").split("/")
+        app = self.app
+        if self.command == "GET" and parts == ["api", "worker", "next"]:
+            worker = (q.get("worker") or ["anonymous"])[0][:64] or "anonymous"
+            caps = [c for c in (q.get("caps") or [""])[0].split(",") if c.strip()]
+            job = app.worker_next(worker, caps)
+            if not job:
+                return self._send(204, b"")
+            return self._send(200, job)
+        if self.command == "GET" and parts == ["api", "worker", "status"]:
+            return self._send(200, app.worker_status())
+        if self.command == "GET" and len(parts) == 4 and parts[:3] == ["api", "worker", "file"]:
+            return self._worker_send_file(parts[3])
+        if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
+                and parts[2] == "heartbeat":
+            ok = app.worker_heartbeat(parts[3])
+            return self._send(200, {"ok": ok, "lease_secs": WORKER_LEASE_SECS})
+        if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
+                and parts[2] == "fail":
+            data = self._json_body() or {}
+            app.worker_fail(parts[3], str(data.get("error", "")))
+            return self._send(200, {"ok": True})
+        if self.command == "POST" and len(parts) == 4 and parts[:2] == ["api", "worker"] \
+                and parts[2] == "result":
+            return self._worker_receive_result(parts[3])
+        return self._send(404, {"error": "Not found"})
+
+    def _worker_send_file(self, job_id):
+        j = self.app.worker_job(job_id)
+        if not j or j["status"] != "claimed" or not os.path.isfile(j["file"]):
+            return self._send(404, {"error": "job not found"})
+        try:
+            size = os.path.getsize(j["file"])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             "attachment; filename=\"%s\"" % os.path.basename(j["file"]))
+            self.end_headers()
+            with open(j["file"], "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 1024 * 1024)
+        except (OSError, BrokenPipeError):
+            pass
+
+    def _worker_receive_result(self, job_id):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 200 * 1024 * 1024 * 1024:
+            return self._send(400, {"error": "bad Content-Length"})
+        tmp = os.path.join(self.app.config["temp_dir"], f".worker-{job_id}.mkv")
+        try:
+            with open(tmp, "wb") as f:
+                remaining = n
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            if remaining != 0:
+                raise OSError("short read")
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return self._send(400, {"error": "upload failed"})
+        result = self.app.worker_finish(job_id, tmp)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return self._send(200, result)
+
     def do_POST(self):
         url = urlparse(self.path)
         if url.path == "/login":
             return self._do_login()
         if self._rate_limited():
             return
+        if url.path.startswith("/api/worker/"):
+            return self._worker_api(url)
         if not self._authed():
             return self._deny()
         data = self._json_body()
