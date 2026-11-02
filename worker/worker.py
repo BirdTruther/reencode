@@ -124,19 +124,22 @@ class Server:
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             raise IOError(f"download failed: {e}")
 
-    def heartbeat(self, job_id):
+    def heartbeat(self, job_id, token):
         try:
             self._req("POST", f"/api/worker/heartbeat/{job_id}",
-                      data=b"", ctype="application/json", timeout=15)
+                      data=json.dumps({"token": token}).encode(),
+                      ctype="application/json", timeout=15)
         except IOError:
             pass
 
-    def upload(self, job_id, path):
+    def upload(self, job_id, path, token):
         # Streamed with an explicit Content-Length so the server can read
-        # exactly the upload (no chunked encoding).
+        # exactly the upload (no chunked encoding). The claim token goes in
+        # the query string: the body is raw bytes, not JSON.
         size = os.path.getsize(path)
+        qs = urllib.parse.urlencode({"token": token})
         req = urllib.request.Request(
-            self.base + f"/api/worker/result/{job_id}", method="POST",
+            self.base + f"/api/worker/result/{job_id}?{qs}", method="POST",
             headers={"Content-Type": "application/octet-stream",
                      "Content-Length": str(size)})
         try:
@@ -150,10 +153,10 @@ class Server:
             raise IOError(f"upload failed: {e}")
         return json.loads(body or b"{}")
 
-    def fail(self, job_id, error):
+    def fail(self, job_id, error, token):
         try:
             self._req("POST", f"/api/worker/fail/{job_id}",
-                      data=json.dumps({"error": error}).encode(),
+                      data=json.dumps({"error": error, "token": token}).encode(),
                       ctype="application/json", timeout=15)
         except IOError:
             pass
@@ -172,6 +175,7 @@ def parse_progress(line, duration):
 
 def run_job(ff, srv, job, caps):
     jid = job["job_id"]
+    token = job["claim_token"]
     os.makedirs(WORK_DIR, exist_ok=True)
     src = os.path.join(WORK_DIR, f"{jid}_in.mkv")
     dst = os.path.join(WORK_DIR, f"{jid}_out.mkv")
@@ -182,21 +186,22 @@ def run_job(ff, srv, job, caps):
 
     def beat():
         while not stop.wait(HEARTBEAT_SECS):
-            srv.heartbeat(jid)
+            srv.heartbeat(jid, token)
 
-    print("  downloading...", flush=True)
-    srv.download(jid, src)
-
-    argv = [a.replace("__INPUT__", src).replace("__OUTPUT__", dst)
-            for a in job["argv"]]
-    argv[0] = ff  # use the ffmpeg we checked, not whatever is first on PATH
-    # Drop -stats (it spams the console); keep -progress via stderr parse.
-    argv = [a for a in argv if a != "-stats"]
-
-    hb = threading.Thread(target=beat, daemon=True)
-    hb.start()
-    tail, rc = [], 1
+    # The heartbeat covers the whole job (download, encode AND upload) so
+    # the lease can't expire mid-transfer on a big file.
+    threading.Thread(target=beat, daemon=True).start()
     try:
+        print("  downloading...", flush=True)
+        srv.download(jid, src)
+
+        argv = [a.replace("__INPUT__", src).replace("__OUTPUT__", dst)
+                for a in job["argv"]]
+        argv[0] = ff  # use the ffmpeg we checked, not whatever is first on PATH
+        # Drop -stats (it spams the console); progress is parsed from stderr.
+        argv = [a for a in argv if a != "-stats"]
+
+        tail = []
         proc = subprocess.Popen(argv, stderr=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, text=True,
                                 errors="replace")
@@ -209,28 +214,26 @@ def run_job(ff, srv, job, caps):
                 last_pct = pct
                 print(f"  encoding... {pct:.0f}%", flush=True)
         rc = proc.wait()
+        if rc != 0:
+            err = "".join(tail[-8:]).strip() or f"ffmpeg exited {rc}"
+            print(f"  FAILED: {err.splitlines()[-1] if err else rc}")
+            srv.fail(jid, err[-2000:], token)
+            return False
+
+        print("  uploading...", flush=True)
+        res = srv.upload(jid, dst, token)
+        if res.get("ok"):
+            print(f"  done -- server placed it ({job['action']})")
+            return True
+        print(f"  server rejected result: {res.get('error')}")
+        return False
     finally:
         stop.set()
-    if rc != 0:
-        err = "".join(tail[-8:]).strip() or f"ffmpeg exited {rc}"
-        print(f"  FAILED: {err.splitlines()[-1] if err else rc}")
-        srv.fail(jid, err[-2000:])
-        return False
-
-    print("  uploading...", flush=True)
-    try:
-        res = srv.upload(jid, dst)
-    finally:
         for p in (src, dst):
             try:
                 os.unlink(p)
             except OSError:
                 pass
-    if res.get("ok"):
-        print(f"  done -- server placed it ({job['action']})")
-        return True
-    print(f"  server rejected result: {res.get('error')}")
-    return False
 
 
 def main():

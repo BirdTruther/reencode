@@ -228,7 +228,7 @@ class WorkerProtocolTest(unittest.TestCase):
                     for a in job["argv"]]
             subprocess.run(argv, capture_output=True, check=True)
 
-            res = app.worker_finish(job["job_id"], str(out))
+            res = app.worker_finish(job["job_id"], str(out), job["claim_token"])
             self.assertTrue(res["ok"], res)
             self.assertFalse(src.exists())
             done = d / "Film 720p.mkv"
@@ -263,8 +263,16 @@ class WorkerProtocolTest(unittest.TestCase):
             d = base / "Movies" / "AV1Film"
             src = d / "AV1Film 1080p.mkv"
             src.parent.mkdir(parents=True, exist_ok=True)
-            run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
-                       "-c:v", "libsvtav1", "-preset", "10", str(src))
+            # libsvtav1 isn't in every ffmpeg build; libaom-av1 is the fallback
+            try:
+                run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
+                           "-c:v", "libsvtav1", "-preset", "10", str(src))
+            except subprocess.CalledProcessError:
+                try:
+                    run_ffmpeg("-f", "lavfi", "-i", "color=size=1920x1080:duration=0.2",
+                               "-c:v", "libaom-av1", "-cpu-used", "8", str(src))
+                except subprocess.CalledProcessError:
+                    self.skipTest("this ffmpeg has no AV1 encoder")
             self.assertEqual(dashboard.ffprobe(str(src))["codec"], "av1")
             conf = write_conf(base)
             app = self._make_app(base, conf)
@@ -274,6 +282,40 @@ class WorkerProtocolTest(unittest.TestCase):
             job = app.worker_next("gpu", ["nvenc", "cuda", "av1d"])
             self.assertIsNotNone(job)
             self.assertEqual(job["filename"], src.name)
+
+    def test_claim_token_guards_the_job(self):
+        with tempfile.TemporaryDirectory() as t:
+            base = Path(t)
+            src = base / "Movies" / "Film" / "Film 1080p.mkv"
+            make_video(src, 1080)
+            app = self._make_app(base, write_conf(base))
+
+            job = app.worker_next("w1", ["software"])
+            jid, tok = job["job_id"], job["claim_token"]
+            # wrong token: no heartbeat, no fail, no finish
+            self.assertFalse(app.worker_heartbeat(jid, "nope"))
+            self.assertFalse(app.worker_fail(jid, "x", "nope"))
+            res = app.worker_finish(jid, str(base / "missing.mkv"), "nope")
+            self.assertFalse(res["ok"])
+            self.assertEqual(app.worker_job(jid)["status"], "claimed")
+            # right token works
+            self.assertTrue(app.worker_heartbeat(jid, tok))
+            self.assertTrue(app.worker_fail(jid, "boom", tok))
+            self.assertEqual(app.worker_job(jid)["status"], "failed")
+
+    def test_file_parked_after_three_failures(self):
+        with tempfile.TemporaryDirectory() as t:
+            base = Path(t)
+            src = base / "Movies" / "Film" / "Film 1080p.mkv"
+            make_video(src, 1080)
+            app = self._make_app(base, write_conf(base))
+
+            for _ in range(3):
+                job = app.worker_next("w1", ["software"])
+                self.assertIsNotNone(job)
+                app.worker_fail(job["job_id"], "boom", job["claim_token"])
+            # three strikes: no more re-downloads of this file
+            self.assertIsNone(app.worker_next("w1", ["software"]))
 
 
 if __name__ == "__main__":
