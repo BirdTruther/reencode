@@ -234,6 +234,7 @@ class WorkerProtocolTest(unittest.TestCase):
         app.library = FakeLibrary(titles)
         app.worker_lock = threading.Lock()
         app.workers_seen = {}
+        app.worker_preparing = {}
         app.jobs = FakeJobRunner()
         return app
 
@@ -447,6 +448,161 @@ class WorkerProtocolTest(unittest.TestCase):
         self.assertIsNone(app.worker_next("w1", ["software"]))
         self.assertIsNone(app.worker_next("w2", ["nvenc", "cuda"]))
 
+    def test_repeat_poll_gets_the_same_claim(self):
+        # The worker timed out waiting for the reply and asks again.
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        first = app.worker_next("w1", ["software"])
+        again = app.worker_next("w1", ["software"])
+        self.assertEqual(again["job_id"], first["job_id"])
+        self.assertEqual(again["claim_token"], first["claim_token"])
+        self.assertEqual(again["argv"], first["argv"])
+        self.assertEqual(len(app._load_worker_jobs()), 1)
+        # and the re-sent claim really works
+        self.assertTrue(app.worker_heartbeat(again["job_id"], again["claim_token"], 5))
+
+    def test_repeat_poll_renews_the_lease(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        app.jobs.enqueue(dirs["Film"])
+        job = app.worker_next("w1", ["software"])
+        jobs = app._load_worker_jobs()
+        jobs[job["job_id"]]["claimed_at"] -= 500
+        jobs[job["job_id"]]["lease_expires"] -= 500
+        app._save_worker_jobs(jobs)
+        self.assertEqual(app.worker_next("w1", ["software"])["job_id"], job["job_id"])
+        left = app._load_worker_jobs()[job["job_id"]]["lease_expires"] - time.time()
+        self.assertGreater(left, dashboard.WORKER_LEASE_SECS - 5)
+
+    def test_started_claim_is_not_handed_out_again(self):
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        first = app.worker_next("w1", ["software"])
+        jobs = app._load_worker_jobs()
+        jobs[first["job_id"]]["claimed_at"] -= 60  # a heartbeat came after the claim
+        app._save_worker_jobs(jobs)
+        second = app.worker_next("w1", ["software"])
+        self.assertNotEqual(second["job_id"], first["job_id"])
+        self.assertNotEqual(second["filename"], first["filename"])
+
+    def test_other_worker_never_gets_someone_elses_claim(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        app.jobs.enqueue(dirs["Film"])
+        self.assertIsNotNone(app.worker_next("w1", ["software"]))
+        self.assertIsNone(app.worker_next("w2", ["software"]))
+
+    def test_changed_caps_are_not_given_the_old_command(self):
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        first = app.worker_next("w1", ["software"])
+        second = app.worker_next("w1", ["nvenc"])
+        self.assertNotEqual(second["job_id"], first["job_id"])
+
+    def _hold_cmd(self, app):
+        """Make the next command build block; returns (started, release)."""
+        started, release = threading.Event(), threading.Event()
+        real = app._worker_cmd
+
+        def slow(*a):
+            started.set()
+            self.assertTrue(release.wait(30))
+            return real(*a)
+        app._worker_cmd = slow
+        self.addCleanup(release.set)
+        return started, release, real
+
+    def _bg_next(self, app, worker):
+        box = {}
+        t = threading.Thread(
+            target=lambda: box.update(job=app.worker_next(worker, ["software"])))
+        t.start()
+        self.addCleanup(t.join, 30)
+        return t, box
+
+    def test_building_a_command_does_not_block_anyone(self):
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        started, release, real = self._hold_cmd(app)
+        t, box = self._bg_next(app, "w1")
+        self.assertTrue(started.wait(30))
+        # w1 is mid-build: the lock is free, so all of this returns now.
+        app._worker_cmd = real
+        other = app.worker_next("w2", ["software"])
+        self.assertTrue(app.worker_heartbeat(other["job_id"], other["claim_token"], 1))
+        app.worker_status()
+        app._merge_worker_info({"queue": []})
+        self.assertFalse(box)  # w1 still waiting
+        release.set()
+        t.join(30)
+        self.assertEqual(box["job"]["filename"], "Film 1080p.mkv")
+        self.assertEqual(other["filename"], "Other 1080p.mkv")
+        self.assertEqual(app.worker_preparing, {})
+
+    def test_file_is_reserved_while_its_command_is_built(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        app.jobs.enqueue(dirs["Film"])
+        started, release, _real = self._hold_cmd(app)
+        t, box = self._bg_next(app, "w1")
+        self.assertTrue(started.wait(30))
+        self.assertIsNone(app.worker_next("w2", ["software"]))
+        self.assertIsNone(app._local_next_title())
+        self.assertEqual(len(app.jobs.queue), 1)
+        release.set()
+        t.join(30)
+        self.assertIsNotNone(box["job"])
+
+    def test_poll_during_own_build_waits_then_gets_the_job(self):
+        # The worker's request timed out while its command was being built.
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        started, release, _real = self._hold_cmd(app)
+        t, box = self._bg_next(app, "w1")
+        self.assertTrue(started.wait(30))
+        self.assertIsNone(app.worker_next("w1", ["software"]))
+        self.assertEqual(app.worker_idle["w1"], "preparing")
+        release.set()
+        t.join(30)
+        retry = app.worker_next("w1", ["software"])
+        self.assertEqual(retry["job_id"], box["job"]["job_id"])
+        self.assertEqual(len(app._load_worker_jobs()), 1)
+
+    def test_title_removed_during_build_leaves_no_claim(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        qj = app.jobs.enqueue(dirs["Film"])
+        started, release, _real = self._hold_cmd(app)
+        t, box = self._bg_next(app, "w1")
+        self.assertTrue(started.wait(30))
+        app.jobs.queue.remove(qj)
+        release.set()
+        t.join(30)
+        self.assertIsNone(box["job"])
+        self.assertEqual(app._load_worker_jobs(), {})
+        self.assertEqual(app.worker_preparing, {})
+
+    def test_failed_command_moves_on_to_the_next_file(self):
+        _base, _conf, app, dirs = self._ctx("Film", "Other")
+        app.jobs.enqueue(dirs["Film"])
+        app.jobs.enqueue(dirs["Other"])
+        real = app._worker_cmd
+        app._worker_cmd = lambda d, p, c: None if "Film" in p else real(d, p, c)
+        job = app.worker_next("w1", ["software"])
+        self.assertEqual(job["filename"], "Other 1080p.mkv")
+        self.assertEqual(app.worker_preparing, {})
+
+    def test_command_crash_releases_the_reservation(self):
+        _base, _conf, app, dirs = self._ctx("Film")
+        app.jobs.enqueue(dirs["Film"])
+
+        def boom(*a):
+            raise RuntimeError("boom")
+        app._worker_cmd = boom
+        self.assertIsNone(app.worker_next("w1", ["software"]))
+        self.assertEqual(app.worker_preparing, {})
+
     def test_av1_jobs_need_av1d_cap(self):
         with tempfile.TemporaryDirectory() as t:
             base = Path(t)
@@ -559,13 +715,14 @@ class WorkerDisplayBase(unittest.TestCase):
         app.library = FakeLibrary({})
         app.worker_lock = threading.Lock()
         app.workers_seen = {}
+        app.worker_preparing = {}
         app.jobs = FakeJobRunner()
         self.app = app
         self.now = time.time()
         self.jobs = {}
 
     def add(self, worker, title, name, status="claimed", age=0, progress=None,
-            lease_left=300, error=""):
+            lease_left=dashboard.WORKER_LEASE_SECS - 10, error=""):
         jid = f"j{len(self.jobs)}"
         self.jobs[jid] = {
             "id": jid, "title": f"/media/TV/{title}", "file": f"/media/TV/{title}/{name}",
@@ -619,6 +776,22 @@ class WorkerDisplayTest(WorkerDisplayBase):
         self.assertEqual(st["workers"][0]["state"], "lost")
         self.assertEqual(st["workers"][0]["jobs"], [])
         self.assertTrue(st["recent"][0]["stale"])
+
+    def test_silent_claim_is_not_encoding(self):
+        # Lease still has minutes left, but no word for longer than heartbeats allow.
+        left = dashboard.WORKER_LEASE_SECS - dashboard.WORKER_STALL_SECS - 5
+        self.add("gaming", "Archer", "e1.mkv", lease_left=left)
+        self.assertEqual(self.merged("Archer")["remote"], [])
+        st = self.app.worker_status()
+        self.assertEqual(st["claimed"], 0)
+        self.assertEqual(st["workers"][0]["state"], "lost")
+        self.assertTrue(st["recent"][0]["stale"])
+
+    def test_claim_within_heartbeat_window_is_encoding(self):
+        left = dashboard.WORKER_LEASE_SECS - dashboard.WORKER_STALL_SECS + 30
+        self.add("gaming", "Archer", "e1.mkv", lease_left=left)
+        self.assertEqual(len(self.merged("Archer")["remote"]), 1)
+        self.assertEqual(self.app.worker_status()["workers"][0]["state"], "encoding")
 
     def test_worker_counts_and_current_file(self):
         self.app.workers_seen["gaming"] = {"caps": ["nvenc"], "last_seen": self.now - 3}

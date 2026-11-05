@@ -549,7 +549,7 @@ function renderWorkers(w) {
     ? w.workers.map(x => {
         const [cls, label] = WORKER_STATE[x.state] || ["b-na", x.state];
         const note = x.state === "idle" ? WORKER_IDLE[x.idle_reason] || "Waiting for work"
-          : x.state === "lost" ? "Its job stopped reporting and will go back in the queue"
+          : x.state === "lost" ? "Its job stopped reporting and goes back in the queue when its lease ends"
           : x.state === "offline" ? "Not connected" : "";
         return `<div class="wk">
           <div class="wk-top">

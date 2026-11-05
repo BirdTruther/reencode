@@ -1209,6 +1209,9 @@ def set_state_dir(d):
 # within this long, or it goes back in the queue. This is what makes
 # killing the worker (to go game) safe.
 WORKER_LEASE_SECS = 600
+# Workers heartbeat every 60s. Past this much silence, a claim is shown as
+# lost contact (the lease still decides when the file really goes back).
+WORKER_STALL_SECS = 180
 
 
 class App:
@@ -1222,6 +1225,7 @@ class App:
         self.jobs = JobRunner(self)
         self.worker_lock = threading.Lock()
         self.workers_seen = {}
+        self.worker_preparing = {}  # file path -> worker, while building its command
 
     def reload_config(self):
         self.config = load_config()
@@ -1298,7 +1302,23 @@ class App:
                     if action in ("encode", "makecopy")]
 
     def _worker_claimed_files(self, jobs):
-        return {j["file"] for j in jobs.values() if j["status"] == "claimed"}
+        """Files nobody else may take. Caller holds worker_lock."""
+        return {j["file"] for j in jobs.values() if j["status"] == "claimed"} \
+            | set(self.worker_preparing)
+
+    @staticmethod
+    def _worker_last_contact(j):
+        """Last heartbeat, or the claim itself if there hasn't been one."""
+        return j.get("lease_expires", 0) - WORKER_LEASE_SECS
+
+    @staticmethod
+    def _worker_offer(j):
+        """What a worker needs to run a claimed job."""
+        return {"job_id": j["id"], "claim_token": j["claim_token"],
+                "filename": j["filename"], "size": j["size"],
+                "action": j["action"], "argv": j["argv"], "out_w": j["out_w"],
+                "out_h": j["out_h"], "duration": j["duration"],
+                "lease_secs": WORKER_LEASE_SECS}
 
     def _worker_cmd(self, title_dir, path, caps):
         """Build the worker's ffmpeg command via reencode.sh --worker-cmd."""
@@ -1324,8 +1344,54 @@ class App:
 
         v1: only files from titles the user queued in the dashboard are
         eligible -- never a library scan. While the queue is paused,
-        workers get nothing (same as the local runner)."""
+        workers get nothing (same as the local runner).
+
+        Safe to repeat: building the command can take longer than the
+        worker waits for a reply. So it runs outside worker_lock with the
+        file reserved, and a worker asking again is handed the claim it
+        never started rather than a second file."""
         caps = {c.strip().lower() for c in caps if c.strip()}
+        failed_cmd = set()
+        while True:
+            picked = self._worker_reserve(worker, caps, failed_cmd)
+            if not isinstance(picked, tuple):
+                return picked  # an offer to re-send, or None
+            qj, f, action, full = picked
+            try:
+                cmd = self._worker_cmd(qj.path, full, caps)
+            except Exception:
+                cmd = None
+            with self.worker_lock:
+                self.worker_preparing.pop(full, None)
+                if not cmd:
+                    failed_cmd.add(full)
+                    continue
+                with self.jobs.lock:
+                    if qj not in self.jobs.queue:
+                        return None  # title removed while we were building
+                now = time.time()
+                jobs = self._load_worker_jobs()
+                jid = uuid.uuid4().hex[:12]
+                jobs[jid] = {
+                    "id": jid, "title": qj.path, "file": full,
+                    "filename": f["name"], "size": f["size"],
+                    "worker": worker, "caps": sorted(caps),
+                    "needs": ["av1d"] if f.get("codec") == "av1" else [],
+                    "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
+                    "out_h": cmd["out_h"], "duration": cmd["duration"],
+                    "newbase": cmd["newbase"], "status": "claimed",
+                    "claim_token": uuid.uuid4().hex, "progress": None,
+                    "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
+                    "attempts": sum(1 for j in jobs.values()
+                                    if j["file"] == full) + 1,
+                }
+                self._save_worker_jobs(jobs)
+                return self._worker_offer(jobs[jid])
+
+    def _worker_reserve(self, worker, caps, failed_cmd):
+        """Decide what a polling worker gets. Returns an offer dict for a
+        claim it never started, None for nothing, or (queued job, file dict,
+        action, full path) for a file now reserved for it."""
         now = time.time()
         with self.worker_lock:
             jobs = self._load_worker_jobs()
@@ -1343,6 +1409,19 @@ class App:
                 return None
             if not queue:
                 self._worker_idle(worker, "empty")
+                return None
+            # A worker runs one job at a time, so if it's asking for work
+            # and holds a claim with no heartbeat, it never got the reply.
+            for j in jobs.values():
+                if j["status"] == "claimed" and j["worker"] == worker \
+                        and j.get("caps") == sorted(caps) \
+                        and self._worker_last_contact(j) <= j.get("claimed_at", 0) + 1:
+                    j["claimed_at"] = now
+                    j["lease_expires"] = now + WORKER_LEASE_SECS
+                    self._save_worker_jobs(jobs)
+                    return self._worker_offer(j)
+            if worker in self.worker_preparing.values():
+                self._worker_idle(worker, "preparing")
                 return None
             claimed = self._worker_claimed_files(jobs)
             done = {j["file"] for j in jobs.values() if j["status"] == "done"}
@@ -1364,43 +1443,21 @@ class App:
                     self._finish_queued_title(qj, by="worker")
                     continue
                 for f, action, full in actionable:
-                    if full in claimed or full in done:
+                    if full in claimed or full in done or full in failed_cmd:
                         continue
                     if failed_counts[full] >= 3:
                         continue
                     needs = {"av1d"} if f.get("codec") == "av1" else set()
                     if not needs <= caps:
                         continue
-                    cmd = self._worker_cmd(qj.path, full, caps)
-                    if not cmd:
-                        continue
-                    jid = uuid.uuid4().hex[:12]
-                    token = uuid.uuid4().hex
-                    jobs[jid] = {
-                        "id": jid, "title": qj.path, "file": full,
-                        "filename": f["name"], "size": f["size"],
-                        "worker": worker, "caps": sorted(caps), "needs": sorted(needs),
-                        "action": action, "argv": cmd["argv"], "out_w": cmd["out_w"],
-                        "out_h": cmd["out_h"], "duration": cmd["duration"],
-                        "newbase": cmd["newbase"], "status": "claimed",
-                        "claim_token": token, "progress": None,
-                        "claimed_at": now, "lease_expires": now + WORKER_LEASE_SECS,
-                        "attempts": sum(1 for j in jobs.values()
-                                        if j["file"] == full) + 1,
-                    }
-                    self._save_worker_jobs(jobs)
-                    j = jobs[jid]
-                    return {"job_id": jid, "claim_token": token,
-                            "filename": j["filename"], "size": j["size"],
-                            "action": action, "argv": j["argv"], "out_w": j["out_w"],
-                            "out_h": j["out_h"], "duration": j["duration"],
-                            "lease_secs": WORKER_LEASE_SECS}
+                    self.worker_preparing[full] = worker
+                    return qj, f, action, full
             self._worker_idle(worker, "nothing")
             return None
 
     def _worker_idle(self, worker, reason):
         """Why a worker got no job (shown in its console so waiting isn't
-        a mystery): paused / empty / nothing."""
+        a mystery): paused / empty / nothing / preparing."""
         if not hasattr(self, "worker_idle"):
             self.worker_idle = {}
         self.worker_idle[worker] = reason
@@ -1614,10 +1671,11 @@ class App:
 
     @staticmethod
     def _worker_active(jobs, now):
-        """Claims still being worked on. An expired claim stays "claimed"
-        until some worker next polls, but nobody is encoding it."""
+        """Claims a worker is still reporting on. A silent claim stays
+        "claimed" until its lease runs out and a worker next polls, but
+        nothing says anyone is encoding it."""
         return [j for j in jobs.values() if j["status"] == "claimed"
-                and j.get("lease_expires", 0) >= now]
+                and now - App._worker_last_contact(j) < WORKER_STALL_SECS]
 
     @staticmethod
     def _worker_failure_outcome(j, done, active, failed_counts, queued):
@@ -1650,6 +1708,7 @@ class App:
 
         active = self._worker_active(jobs, now)
         active_files = {j["file"] for j in active}
+        active_ids = {j["id"] for j in active}
         queued = set(qpaths)
         failed_jobs = [j for j in jobs.values() if j["status"] == "failed"]
         failed_counts = collections.Counter(j["file"] for j in failed_jobs)
@@ -1674,10 +1733,8 @@ class App:
         for name in sorted(set(seen) | set(history)):
             mine = history.get(name, [])
             w = seen.get(name, {})
-            # A lease is set to now + WORKER_LEASE_SECS on every heartbeat.
             last_seen = max([w.get("last_seen", 0)]
-                            + [j.get("lease_expires", 0) - WORKER_LEASE_SECS
-                               for j in mine])
+                            + [self._worker_last_contact(j) for j in mine])
             current = [j for j in active if j["worker"] == name]
             if current:
                 state = "encoding"
@@ -1712,7 +1769,7 @@ class App:
             "recent": [{"id": j["id"], "filename": j["filename"], "worker": j["worker"],
                         "action": j["action"], "status": j["status"],
                         "stale": j["status"] == "claimed"
-                        and j.get("lease_expires", 0) < now,
+                        and j["id"] not in active_ids,
                         "progress": j.get("progress"),
                         "error": j.get("error", "")} for j in recent],
         }

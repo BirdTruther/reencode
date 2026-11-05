@@ -604,7 +604,8 @@ def main():
             if not job:
                 why = {"paused": "the queue is paused — press ▶ Start in the dashboard",
                        "empty": "nothing is queued — add a title in the dashboard",
-                       "nothing": "queued titles have nothing I can take right now"
+                       "nothing": "queued titles have nothing I can take right now",
+                       "preparing": "the server is preparing my next file"
                        }.get(getattr(srv, "idle_reason", ""), "nothing queued")
                 st.show(f"  💤 {why}…   "
                         f"✅ {session['done']} done · ❌ {session['failed']} failed")
