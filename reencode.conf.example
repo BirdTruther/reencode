@@ -44,3 +44,9 @@ HW_DECODE="auto"
 
 # Dashboard only: hours it may encode, e.g. "01:00-08:00". Empty = any time.
 ENCODE_HOURS=""
+
+# Optional: POST a message here when the circuit breaker trips and after each
+# title. Sends JSON with title, body and type, which suits the Apprise API; add
+# ?tag=... to pick an Apprise tag. Unset = no notifications. A failed post never
+# affects encoding. Can also be set as an environment variable.
+# REENCODE_NOTIFY_URL="http://apprise.local:8000/notify/mykey?tag=media"

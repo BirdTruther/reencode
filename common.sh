@@ -79,6 +79,10 @@ detect_vaapi() {
 # Write the current settings to $CONFIG_PATH.
 write_config() {
     mkdir -p "$(dirname "$CONFIG_PATH")"
+    # Keep the file's own line, so a dashboard save doesn't drop it and a value
+    # from the environment doesn't get written into the file.
+    local notify_line=""
+    [[ -f "$CONFIG_PATH" ]] && notify_line=$(grep -m1 '^REENCODE_NOTIFY_URL=' "$CONFIG_PATH")
     cat > "$CONFIG_PATH" <<EOF
 # reencode.conf - edit and re-run, or delete to regenerate.
 
@@ -119,6 +123,9 @@ HW_DECODE="${HW_DECODE}"
 
 # Dashboard only: hours it may encode, e.g. "01:00-08:00". Empty = any time.
 ENCODE_HOURS="${ENCODE_HOURS}"
+
+# Optional: POST a message here when the circuit breaker trips and after each title.
+${notify_line:-# REENCODE_NOTIFY_URL=\"http://apprise.local:8000/notify/mykey?tag=media\"}
 EOF
 }
 

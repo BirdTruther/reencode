@@ -14,6 +14,7 @@ services:
       - PGID=1000
       - TZ=Etc/UTC                     # your timezone, used for encoding hours (e.g. America/New_York)
       # - REENCODE_DASHBOARD_PASSWORD=pick-one   # otherwise one is generated: docker logs reencode
+      # - REENCODE_NOTIFY_URL=http://apprise.local:8000/notify/mykey?tag=media   # optional, see README
     # Create these folders before the first start (mkdir -p ...); change the left-hand side only.
     volumes:
       - /path/to/config:/config        # settings, history, logs, generated password

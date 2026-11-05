@@ -37,6 +37,25 @@ LAST_FAIL_SIG=""
 # Partial output currently being written; removed if we're interrupted.
 CURRENT_PART=""
 
+# Optional notification (Apprise API or anything else that takes this JSON).
+# Does nothing unless REENCODE_NOTIFY_URL is set. Uses Python because it's
+# always in the image (curl isn't). SIGALRM caps the whole post at 5 seconds,
+# including DNS, and a failed post only logs a warning: encoding never depends
+# on it. $1 = title, $2 = body, $3 = type: info, success, warning or failure.
+send_notification() {
+    [[ -n "${REENCODE_NOTIFY_URL:-}" && "$DRY_RUN" != true ]] || return 0
+    python3 -I -c '
+import json, signal, sys, urllib.request
+signal.alarm(5)
+url, title, body, kind = sys.argv[1:]
+data = json.dumps({"title": title, "body": body, "type": kind}).encode()
+req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=5).close()
+' "$REENCODE_NOTIFY_URL" "$1" "$2" "$3" </dev/null >/dev/null 2>&1 \
+        || log_warn "Notification not sent (check REENCODE_NOTIFY_URL)"
+    return 0
+}
+
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
@@ -676,6 +695,9 @@ process_show() {
                 if [[ "$CONSEC_FAIL" -ge "$CIRCUIT_MAX" ]]; then
                     CIRCUIT_TRIPPED=true
                     log_err "Circuit breaker: $CONSEC_FAIL consecutive failures with the same error ($CONSEC_SIG), aborting batch."
+                    send_notification "Reencode: circuit breaker tripped" \
+                        "$show_name: $CONSEC_FAIL consecutive failures with the same error ($CONSEC_SIG). Batch aborted." \
+                        failure
                     break
                 fi ;;
         esac
@@ -696,6 +718,17 @@ process_show() {
         log_ok "  Space saved: ${total_saved}MB (~$(( total_saved / 1024 ))GB)"
     fi
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Nothing encoded and nothing failed (e.g. all skipped): no news to send.
+    if [[ $((encoded_files + failed_files)) -gt 0 ]]; then
+        local notify_type=success
+        [[ "$failed_files" -gt 0 ]] && notify_type=warning
+        send_notification "Reencode: $show_name" \
+            "Files processed: $encoded_files
+Space saved: $(( total_saved > 0 ? total_saved : 0 ))MB (before originals are replaced)
+Failures: $failed_files" \
+            "$notify_type"
+    fi
 
     [[ "$failed_files" -eq 0 ]]
 }

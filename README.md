@@ -56,6 +56,7 @@ Paste the compose file into their "import compose" or stack screen, or create th
 | `PUID` / `PGID` | The user/group that owns your videos (run `id` to find them) |
 | `TZ`     | Your timezone, e.g. `America/New_York` |
 | `REENCODE_DASHBOARD_PASSWORD` | Optional: your own password. Otherwise one is generated and shown in the logs |
+| `REENCODE_NOTIFY_URL` | Optional: where to send notifications, see [Notifications](#notifications) |
 | `/config`    | Settings, history and logs (keep this) |
 | `/transcode` | Scratch space for encodes (an SSD is ideal) |
 | `/media/...` | Your libraries, e.g. `/media/TV` and `/media/Movies` |
@@ -98,6 +99,20 @@ Change these in the dashboard under **Settings**, or edit `reencode.conf` (creat
 | Encoding hours | any time | e.g. `01:00-08:00`. Outside these hours encodes pause and resume later |
 | Temp folder | `/tmp/reencode` (`/transcode` in Docker) | Where new files are written before they replace the originals |
 | Log folder | `~/reencode_logs` (`/config/logs` in Docker) | Full encoder output for each file |
+
+### Notifications
+
+Set `REENCODE_NOTIFY_URL` to get a message when the circuit breaker stops a batch (`failure`) and after each title that encoded or failed anything (`success`, or `warning` if some files failed), with the files processed, space saved and failures. There are no per-file messages, and dry runs send nothing.
+
+Set it as an environment variable or in `reencode.conf`; if both are set, `reencode.conf` wins. Without it, nothing is sent.
+
+Each message is a JSON `POST` with `title`, `body` and `type`, which works with the [Apprise API](https://github.com/caronc/apprise-api). Add `?tag=` to pick an Apprise tag:
+
+```
+REENCODE_NOTIFY_URL=http://apprise.local:8000/notify/mykey?tag=media
+```
+
+Posts time out after 5 seconds. A failed post only logs a warning and never affects encoding. The space saved is counted before the originals are replaced, so a title that fails or keeps its originals won't actually free that space.
 
 ### Profiles and 4K
 
