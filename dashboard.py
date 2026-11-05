@@ -1612,10 +1612,30 @@ class App:
                 self.library.request_scan([j["title"]])
             return {"ok": ok, "error": data.get("error")}
 
+    @staticmethod
+    def _worker_active(jobs, now):
+        """Claims still being worked on. An expired claim stays "claimed"
+        until some worker next polls, but nobody is encoding it."""
+        return [j for j in jobs.values() if j["status"] == "claimed"
+                and j.get("lease_expires", 0) >= now]
+
+    @staticmethod
+    def _worker_failure_outcome(j, done, active, failed_counts, queued):
+        """What became of a failed attempt: the same file may have been
+        retried successfully since, so a failure isn't always still a problem."""
+        if j["file"] in done:
+            return "fixed"
+        if j["file"] in active:
+            return "retrying"
+        if j["title"] not in queued:
+            return "not_queued"
+        return "parked" if failed_counts[j["file"]] >= 3 else "waiting"
+
     def worker_status(self):
         with self.worker_lock:
             jobs = self._load_worker_jobs()
-            seen = dict(self.workers_seen)
+            seen = {n: dict(w) for n, w in self.workers_seen.items()}
+            idle_reasons = dict(getattr(self, "worker_idle", {}))
         now = time.time()
         # v1: pending counts actionable files in explicitly queued titles.
         with self.jobs.lock:
@@ -1627,39 +1647,92 @@ class App:
             act = self._worker_actionable(p) or []
             pending += sum(1 for _f, _a, full in act
                            if full not in claimed and full not in done)
+
+        active = self._worker_active(jobs, now)
+        active_files = {j["file"] for j in active}
+        queued = set(qpaths)
+        failed_jobs = [j for j in jobs.values() if j["status"] == "failed"]
+        failed_counts = collections.Counter(j["file"] for j in failed_jobs)
+        failures = [{"id": j["id"], "filename": j["filename"],
+                     "title": os.path.basename(j["title"]), "worker": j["worker"],
+                     "error": j.get("error", ""), "attempts": j.get("attempts"),
+                     "claimed_at": j.get("claimed_at"),
+                     "outcome": self._worker_failure_outcome(
+                         j, done, active_files, failed_counts, queued)}
+                    for j in failed_jobs]
+        open_outcomes = {"waiting", "parked"}
+        # Newest first, but what's still a problem never falls off the list.
+        failures.sort(key=lambda f: f["claimed_at"] or 0, reverse=True)
+        failures.sort(key=lambda f: f["outcome"] not in open_outcomes)
+
+        # workers_seen is memory-only: after a dashboard restart, the job
+        # file is the only record of a worker until its next poll.
+        history = {}
+        for j in sorted(jobs.values(), key=lambda j: j.get("claimed_at", 0)):
+            history.setdefault(j["worker"], []).append(j)
+        workers = []
+        for name in sorted(set(seen) | set(history)):
+            mine = history.get(name, [])
+            w = seen.get(name, {})
+            # A lease is set to now + WORKER_LEASE_SECS on every heartbeat.
+            last_seen = max([w.get("last_seen", 0)]
+                            + [j.get("lease_expires", 0) - WORKER_LEASE_SECS
+                               for j in mine])
+            current = [j for j in active if j["worker"] == name]
+            if current:
+                state = "encoding"
+            elif any(j["status"] == "claimed" for j in mine):
+                state = "lost"
+            else:
+                state = "idle" if now - last_seen < 45 else "offline"
+            workers.append({
+                "name": name,
+                "caps": w.get("caps") or (mine[-1].get("caps", []) if mine else []),
+                "last_seen_secs_ago": max(0, int(now - last_seen)),
+                "state": state,
+                "idle_reason": idle_reasons.get(name, "") if state == "idle" else "",
+                "jobs": [{"filename": j["filename"],
+                          "title": os.path.basename(j["title"]),
+                          "progress": j.get("progress")} for j in current],
+                "done": sum(1 for j in mine if j["status"] == "done"),
+                "failed": sum(1 for j in mine if j["status"] == "failed"),
+                "failing": sum(1 for f in failures if f["worker"] == name
+                               and f["outcome"] in open_outcomes),
+            })
+
         recent = sorted(jobs.values(), key=lambda j: j.get("claimed_at", 0), reverse=True)[:15]
         return {
-            "workers": [{"name": n, "caps": w["caps"],
-                         "last_seen_secs_ago": int(now - w["last_seen"])}
-                        for n, w in seen.items()],
+            "workers": workers,
             "pending": pending,
-            "claimed": sum(1 for j in jobs.values() if j["status"] == "claimed"),
+            "claimed": len(active),
             "done": sum(1 for j in jobs.values() if j["status"] == "done"),
-            "failed": sum(1 for j in jobs.values() if j["status"] == "failed"),
+            "failed": len(failed_jobs),
+            "failing": sum(1 for f in failures if f["outcome"] in open_outcomes),
+            "failures": failures[:50],
             "recent": [{"id": j["id"], "filename": j["filename"], "worker": j["worker"],
                         "action": j["action"], "status": j["status"],
+                        "stale": j["status"] == "claimed"
+                        and j.get("lease_expires", 0) < now,
                         "progress": j.get("progress"),
                         "error": j.get("error", "")} for j in recent],
         }
 
     def _merge_worker_info(self, jobs_state):
-        """Annotate queued titles with their worker claim (for the UI).
+        """Add active worker claims to the job state (for the UI): all of
+        them under "remote", and per title on its queue row.
 
         Called after jobs.state() -- sequential locking, never nested."""
         with self.worker_lock:
             wjobs = self._load_worker_jobs()
-        by_title = {}
-        for j in wjobs.values():
-            if j["status"] == "claimed":
-                by_title[j["title"]] = {"worker": j["worker"],
-                                        "progress": j.get("progress"),
-                                        "filename": j["filename"]}
+        active = sorted(self._worker_active(wjobs, time.time()),
+                        key=lambda j: (j["title"], j["worker"], j["filename"]))
+        remote = [{"worker": j["worker"], "progress": j.get("progress"),
+                   "filename": j["filename"], "path": j["title"],
+                   "title": os.path.basename(j["title"])} for j in active]
+        jobs_state["remote"] = remote
         for q in jobs_state.get("queue", []):
-            info = by_title.get(q["path"])
-            if info:
-                q["worker_name"] = info["worker"]
-                q["worker_progress"] = info["progress"]
-                q["worker_file"] = info["filename"]
+            q["workers"] = [] if q.get("dry_run") else \
+                [r for r in remote if r["path"] == q["path"]]
 
     def queue_eta(self, jobs, titles):
         """Estimate encoding time for the running title plus everything queued."""

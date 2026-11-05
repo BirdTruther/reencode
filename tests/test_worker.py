@@ -7,6 +7,7 @@ dashboard's claim -> encode -> finish loop, end to end.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -329,8 +330,9 @@ class WorkerProtocolTest(unittest.TestCase):
         # and it shows up on the queued title for the UI
         merged = {"queue": [{"path": str(dirs["Film"]), "name": "Film"}]}
         app._merge_worker_info(merged)
-        self.assertEqual(merged["queue"][0]["worker_name"], "w1")
-        self.assertEqual(merged["queue"][0]["worker_progress"], 47.5)
+        row = merged["queue"][0]["workers"][0]
+        self.assertEqual(row["worker"], "w1")
+        self.assertEqual(row["progress"], 47.5)
 
     def test_local_runner_skips_worker_title(self):
         _base, _conf, app, dirs = self._ctx("Film", "Other")
@@ -544,6 +546,300 @@ class WorkerUploadTest(unittest.TestCase):
             srv.upload("j", self._file(60), "bad")
         self.assertFalse(cm.exception.retry)
         self.assertIn("404", str(cm.exception))
+
+
+class WorkerDisplayBase(unittest.TestCase):
+    """A real App with hand-written job records; no encoding, no ffmpeg."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        dashboard.set_state_dir(Path(t.name))
+        app = dashboard.App.__new__(dashboard.App)
+        app.library = FakeLibrary({})
+        app.worker_lock = threading.Lock()
+        app.workers_seen = {}
+        app.jobs = FakeJobRunner()
+        self.app = app
+        self.now = time.time()
+        self.jobs = {}
+
+    def add(self, worker, title, name, status="claimed", age=0, progress=None,
+            lease_left=300, error=""):
+        jid = f"j{len(self.jobs)}"
+        self.jobs[jid] = {
+            "id": jid, "title": f"/media/TV/{title}", "file": f"/media/TV/{title}/{name}",
+            "filename": name, "worker": worker, "caps": ["cuda", "nvenc"],
+            "action": "encode", "status": status, "progress": progress,
+            "claim_token": "secret-token", "attempts": 1, "error": error,
+            "claimed_at": self.now - age, "lease_expires": self.now + lease_left,
+        }
+        self.app._save_worker_jobs(self.jobs)
+
+    def queue(self, title):
+        self.app.jobs.enqueue(Path("/media/TV") / title)
+
+    def merged(self, *titles):
+        state = {"queue": [{"path": f"/media/TV/{t}", "name": t, "dry_run": False}
+                           for t in titles]}
+        self.app._merge_worker_info(state)
+        return state
+
+
+class WorkerDisplayTest(WorkerDisplayBase):
+    def test_every_worker_on_a_title_is_listed(self):
+        self.add("gaming", "Archer", "e1.mkv", progress=12.0)
+        self.add("desktop 2", "Archer", "e2.mkv", progress=68.0)
+        state = self.merged("Archer")
+        rows = {w["worker"]: w for w in state["queue"][0]["workers"]}
+        self.assertEqual(set(rows), {"gaming", "desktop 2"})
+        self.assertEqual(rows["gaming"]["filename"], "e1.mkv")
+        self.assertEqual(rows["desktop 2"]["progress"], 68.0)
+        self.assertEqual({r["worker"] for r in state["remote"]}, {"gaming", "desktop 2"})
+        self.assertEqual(state["remote"][0]["title"], "Archer")
+
+    def test_claim_on_unqueued_title_still_counts_as_remote(self):
+        self.add("gaming", "Archer", "e1.mkv")
+        state = self.merged()
+        self.assertEqual(len(state["remote"]), 1)
+
+    def test_preview_row_does_not_show_workers(self):
+        self.add("gaming", "Archer", "e1.mkv")
+        state = {"queue": [{"path": "/media/TV/Archer", "dry_run": True}]}
+        self.app._merge_worker_info(state)
+        self.assertEqual(state["queue"][0]["workers"], [])
+
+    def test_expired_lease_is_not_encoding(self):
+        self.add("gaming", "Archer", "e1.mkv", progress=40.0, lease_left=-1)
+        state = self.merged("Archer")
+        self.assertEqual(state["remote"], [])
+        self.assertEqual(state["queue"][0]["workers"], [])
+        st = self.app.worker_status()
+        self.assertEqual(st["claimed"], 0)
+        self.assertEqual(st["workers"][0]["state"], "lost")
+        self.assertEqual(st["workers"][0]["jobs"], [])
+        self.assertTrue(st["recent"][0]["stale"])
+
+    def test_worker_counts_and_current_file(self):
+        self.app.workers_seen["gaming"] = {"caps": ["nvenc"], "last_seen": self.now - 3}
+        self.add("gaming", "Archer", "e1.mkv", progress=50.0)
+        self.add("gaming", "Archer", "e2.mkv", status="done")
+        self.add("gaming", "Archer", "e3.mkv", status="done")
+        self.add("gaming", "Archer", "e4.mkv", status="failed", error="boom")
+        self.add("desktop 2", "Archer", "e5.mkv", status="done")
+        self.queue("Archer")
+        workers = {w["name"]: w for w in self.app.worker_status()["workers"]}
+        g = workers["gaming"]
+        self.assertEqual((g["state"], g["done"], g["failed"], g["failing"]),
+                         ("encoding", 2, 1, 1))
+        self.assertEqual(g["caps"], ["nvenc"])
+        self.assertEqual(g["jobs"], [{"filename": "e1.mkv", "title": "Archer",
+                                      "progress": 50.0}])
+        self.assertEqual((workers["desktop 2"]["done"], workers["desktop 2"]["failing"]),
+                         (1, 0))
+
+    def test_busy_worker_survives_dashboard_restart(self):
+        # workers_seen starts empty; only the job file knows this worker.
+        self.add("gaming", "Archer", "e1.mkv", lease_left=dashboard.WORKER_LEASE_SECS - 20)
+        w = self.app.worker_status()["workers"][0]
+        self.assertEqual((w["name"], w["state"]), ("gaming", "encoding"))
+        self.assertEqual(w["caps"], ["cuda", "nvenc"])
+        self.assertLess(abs(w["last_seen_secs_ago"] - 20), 3)
+
+    def test_idle_and_offline(self):
+        self.app.workers_seen["on"] = {"caps": [], "last_seen": self.now - 5}
+        self.app.workers_seen["off"] = {"caps": [], "last_seen": self.now - 500}
+        self.app._worker_idle("on", "paused")
+        self.app._worker_idle("off", "paused")
+        workers = {w["name"]: w for w in self.app.worker_status()["workers"]}
+        self.assertEqual((workers["on"]["state"], workers["on"]["idle_reason"]),
+                         ("idle", "paused"))
+        self.assertEqual((workers["off"]["state"], workers["off"]["idle_reason"]),
+                         ("offline", ""))
+
+    def test_failure_outcomes(self):
+        self.queue("Q")
+        # retried fine later
+        self.add("w", "Q", "fixed.mkv", status="failed", error="replace_original failed")
+        self.add("w", "Q", "fixed.mkv", status="done")
+        # being retried right now
+        self.add("w", "Q", "retry.mkv", status="failed")
+        self.add("w", "Q", "retry.mkv")
+        # one failure, still queued
+        self.add("w", "Q", "wait.mkv", status="failed", error="ffmpeg died")
+        # three failures: parked
+        for _ in range(3):
+            self.add("w", "Q", "park.mkv", status="failed")
+        # title no longer queued
+        self.add("w", "Gone", "gone.mkv", status="failed")
+        st = self.app.worker_status()
+        by_file = {f["filename"]: f["outcome"] for f in st["failures"]}
+        self.assertEqual(by_file, {"fixed.mkv": "fixed", "retry.mkv": "retrying",
+                                   "wait.mkv": "waiting", "park.mkv": "parked",
+                                   "gone.mkv": "not_queued"})
+        self.assertEqual(st["failed"], 7)
+        self.assertEqual(st["failing"], 4)  # wait + 3x park
+        # what's still a problem sorts first
+        self.assertEqual({f["outcome"] for f in st["failures"][:4]}, {"waiting", "parked"})
+        reason = [f for f in st["failures"] if f["filename"] == "wait.mkv"][0]["error"]
+        self.assertEqual(reason, "ffmpeg died")
+
+    def test_old_failures_outlast_recent_cutoff(self):
+        self.queue("Q")
+        self.add("w", "Q", "old.mkv", status="failed", age=9000, error="boom")
+        for i in range(20):
+            self.add("w", "Q", f"new{i}.mkv", status="done", age=i)
+        st = self.app.worker_status()
+        self.assertNotIn("old.mkv", [j["filename"] for j in st["recent"]])
+        self.assertEqual([f["filename"] for f in st["failures"]], ["old.mkv"])
+
+    def test_open_failure_is_not_crowded_out_of_the_list(self):
+        self.queue("Q")
+        self.add("w", "Q", "open.mkv", status="failed", age=9000)
+        for i in range(60):
+            self.add("w", "Gone", f"g{i}.mkv", status="failed", age=i)
+        st = self.app.worker_status()
+        self.assertEqual(len(st["failures"]), 50)
+        self.assertEqual(st["failures"][0]["filename"], "open.mkv")
+
+    def test_status_keeps_paths_and_tokens_private(self):
+        # /api/worker/status needs no login.
+        self.add("w", "Archer", "e1.mkv", progress=1.0)
+        self.add("w", "Archer", "e2.mkv", status="failed")
+        body = json.dumps(self.app.worker_status())
+        self.assertNotIn("/media/TV", body)
+        self.assertNotIn("secret-token", body)
+
+
+RENDER_HARNESS = r"""
+const fs = require("fs"), vm = require("vm");
+const { html, state, status } = JSON.parse(fs.readFileSync(0, "utf8"));
+const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+// A stand-in for any DOM element: remembers what's set, anything else is
+// another stand-in that can also be called.
+function el() {
+  const props = { innerHTML: "", textContent: "", value: "", checked: false, hidden: false };
+  return new Proxy(function () {}, {
+    get: (_t, k) => {
+      if (k === Symbol.toPrimitive) return () => "";
+      if (!(k in props)) props[k] = el();
+      return props[k];
+    },
+    set: (_t, k, v) => { props[k] = v; return true; },
+    apply: () => undefined,
+  });
+}
+const els = {};
+const document = el();
+document.hidden = false;
+document.querySelector = s => els[s] || (els[s] = el());
+document.querySelectorAll = () => [];
+const respond = body => ({ status: 200, ok: true, json: async () => body });
+const ctx = vm.createContext({
+  document, console, Date, Math, JSON, Intl, Set, Map, Object, String, Promise,
+  localStorage: { getItem: () => null, setItem() {} },
+  location: {}, confirm: () => true,
+  setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0,
+  fetch: async path => respond(path === "/api/state" ? state : status),
+});
+vm.runInContext(script, ctx);
+setTimeout(() => {
+  const out = {};
+  for (const id of ["#nowCard", "#queueList", "#workerList", "#workerFails", "#workerCount", "#banners"])
+    out[id] = els[id] ? els[id].innerHTML : "";
+  process.stdout.write(JSON.stringify(out));
+}, 50);
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class DashboardRenderTest(WorkerDisplayBase):
+    """Runs the page's own script against real API output."""
+
+    def render(self, *titles, current=None):
+        jobs = self.merged(*titles)
+        jobs.update(current=current, history=[], paused=False)
+        for q in jobs["queue"]:
+            q.update(id=q["name"], library="/media/TV")
+        state = {
+            "config": {"libraries": ["/media/TV"], "library_profiles": ["tv"],
+                       "profiles": {"tv": {"height": 720}, "movies": {"height": 720}},
+                       "encoder": "nvenc", "encode_hours": ""},
+            "stats": {"library_bytes": 1, "files": 1, "to_encode_files": 1,
+                      "to_encode_bytes": 1, "est_savings_bytes": 1, "size_ratio": 0.6,
+                      "saved_mb": 0},
+            "scan": {"running": False, "last": None}, "auth_required": False,
+            "external": [], "eta": {"per_job": {}}, "jobs": jobs,
+            "titles": [{"path": "/media/TV/Other", "name": "Other", "library": "/media/TV",
+                        "above": 2, "at": 0, "files": 2, "size": 5, "above_size": 5,
+                        "status": "ready"}],
+        }
+        payload = {"html": (ROOT / "web" / "index.html").read_text(encoding="utf-8"),
+                   "state": state, "status": self.app.worker_status()}
+        r = subprocess.run(["node", "-e", RENDER_HARNESS], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_status_card_shows_remote_encodes(self):
+        self.add("gaming", "Archer", "e1.mkv", progress=12.0)
+        self.add("desktop 2", "Archer", "e2.mkv", progress=68.0)
+        self.queue("Archer")
+        now = self.render("Archer")["#nowCard"]
+        self.assertNotIn("Nothing encoding", now)
+        self.assertNotIn("files to shrink", now)
+        self.assertIn("2 workers", now)
+        for text in ("gaming", "desktop 2", "e1.mkv", "e2.mkv", "12%", "68%"):
+            self.assertIn(text, now)
+
+    def test_status_card_idle_without_claims(self):
+        self.assertIn("Nothing encoding", self.render()["#nowCard"])
+        self.add("gaming", "Archer", "e1.mkv", lease_left=-1)  # dead, not encoding
+        self.assertIn("Nothing encoding", self.render()["#nowCard"])
+
+    def test_queue_row_shows_every_worker(self):
+        self.add("gaming", "Archer", "e1.mkv", progress=12.0)
+        self.add("desktop 2", "Archer", "e2.mkv", progress=68.0)
+        self.queue("Archer")
+        row = self.render("Archer")["#queueList"]
+        for text in ("gaming 12%", "desktop 2 68%", "e1.mkv", "e2.mkv"):
+            self.assertIn(text, row)
+
+    def test_workers_section_and_failures(self):
+        self.queue("Q")
+        self.add("gaming", "Q", "e1.mkv", progress=50.0)
+        self.add("gaming", "Q", "bad.mkv", status="failed", error="ffmpeg died")
+        self.add("gaming", "Q", "ok.mkv", status="failed", error="replace_original failed")
+        self.add("gaming", "Q", "ok.mkv", status="done")
+        out = self.render("Q")
+        self.assertIn("gaming", out["#workerList"])
+        self.assertIn("nvenc", out["#workerList"])
+        self.assertIn("e1.mkv", out["#workerList"])
+        self.assertIn("1 done", out["#workerList"])
+        self.assertIn("2 failed", out["#workerList"])
+        self.assertIn("Still failing", out["#workerFails"])
+        self.assertIn("ffmpeg died", out["#workerFails"])
+        self.assertIn("Retried OK", out["#workerFails"])
+        self.assertIn("1 still failing", out["#workerCount"])
+
+    def test_banner_only_when_something_is_still_failing(self):
+        self.queue("Q")
+        self.add("gaming", "Q", "ok.mkv", status="failed", error="x")
+        self.add("gaming", "Q", "ok.mkv", status="done")
+        self.assertNotIn("still failing", self.render("Q")["#banners"])
+        self.add("gaming", "Q", "bad.mkv", status="failed", error="x")
+        self.assertIn("still failing", self.render("Q")["#banners"])
+
+    def test_worker_supplied_text_is_escaped(self):
+        # Worker names come from an unauthenticated query parameter.
+        evil = "<img src=x onerror=alert(1)>"
+        self.queue("Q")
+        self.add(evil, "Q", evil, progress=5.0)
+        self.add(evil, "Q", "bad.mkv", status="failed", error=evil)
+        out = self.render("Q")
+        for key in ("#nowCard", "#queueList", "#workerList", "#workerFails"):
+            self.assertNotIn("<img", out[key], key)
+            self.assertIn("&lt;img", out[key], key)
 
 
 if __name__ == "__main__":
